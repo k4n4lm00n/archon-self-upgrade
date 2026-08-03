@@ -1,0 +1,11 @@
+{
+  "captured_utc": "<iso-8601-utc>",
+  "live_worktree": "/home/user/worktrees/<live-worktree>",
+  "live_branch": "mylive-<id>",
+  "live_sha": "<40-char-sha>",
+  "live_pgid": "<pgid-of-live-dev-process>",
+  "live_port": "3090",
+  "old_platforms": "Web;<other-active-platforms>",
+  "stage_worktree": "/home/user/worktrees/<stage-worktree>",
+  "stage_branch": "<stage-branch>"
+}

@@ -1,0 +1,8 @@
+# Runtime artifacts — never commit
+logs/
+*.log
+*.bak-*
+state.json
+cutover-status.json
+.env
+.env.*
