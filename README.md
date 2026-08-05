@@ -10,6 +10,14 @@ runs the upgrade lives **inside that server's process group**. So the cutover ha
 and replace the very process tree it is running in, and still guarantee the link
 comes back — or roll itself back if it doesn't.
 
+## Scope
+
+Part of our work **extending Archon to our own needs** (adapters, plugins, workflows,
+providers) and **fixing core limitations that block that work** — here, upgrading our own
+running server safely. We keep our fork compatible with upstream `dev` so maintainers can
+merge effortlessly; **upstream CI / infrastructure health is the maintainers' concern, not
+ours** — we don't chase green pipelines on infra we don't own.
+
 > This README is the global index. Details live in [`docs/`](docs/).
 >
 > **Two forms of the same thing:** [`archon-self-upgrade.yaml`](archon-self-upgrade.yaml)
