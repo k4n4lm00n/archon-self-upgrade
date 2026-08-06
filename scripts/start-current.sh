@@ -10,10 +10,11 @@
 # fixed path and used as a container/service entrypoint, where a toolkit checkout may not
 # exist yet. Defaults mirror lib.sh; every value is env-overridable by the same names.
 #
-#   start-current.sh                 detect + start + gate, then exit
+#   start-current.sh                 detect + start + gate + boot hooks, then exit
 #   start-current.sh --detect-only   print what it would start, change nothing
-#   start-current.sh --entrypoint    detect + start + gate, then stay in the foreground
-#                                    and forward SIGTERM/SIGINT to the server group
+#   start-current.sh --entrypoint    ... then stay in the foreground and forward
+#                                    SIGTERM/SIGINT to the server group
+#   start-current.sh --no-hooks      skip the boot hooks (server only)
 #
 # Detection order — first hit wins, it never guesses:
 #   1. a server already running          -> adopt it (idempotent, safe to re-run)
@@ -21,6 +22,12 @@
 #   3. newest cutover-status.json under $ARCHON_UPGRADE_DIRS
 #      `success` / `rolled_back` name the serving worktree in `detail`; any other phase
 #      falls back to `live_worktree` in the sibling state.json
+#
+# Once the server is healthy, every executable in $BOOT_HOOKS_DIR runs in lexical order:
+# the side processes the server does not own (pollers, sync daemons, tunnels). Each project
+# installs its own hook there, so what comes back after a restart is owned by the projects
+# rather than by this script. Hooks must be idempotent — they run on the adopt path too,
+# which makes a bare re-run a repair pass — and a failing hook is logged, never fatal.
 #
 # Exit: 0 healthy (or already running) | 1 nothing detected / target unusable
 #       2 started but did not pass the gate (the server is LEFT RUNNING for inspection)
@@ -50,6 +57,17 @@ REQUIRE_PLATFORMS="${REQUIRE_PLATFORMS:-}"            # ';'-list that must be ac
 START_DEADLINE="${START_DEADLINE:-150}"
 POST_START_CMD="${POST_START_CMD:-}"                  # optional; run once, after healthy
 
+# ---- Boot hooks: what else the host needs running once the server is up ----------------
+# Every executable in BOOT_HOOKS_DIR runs (lexical order) after the server is confirmed
+# healthy — the place for the side processes a server does not own: pollers, sync daemons,
+# tunnels, watchdogs. A project registers itself by installing one file here, so the set of
+# things that come back after a restart lives with the projects instead of in one host script.
+# Hooks MUST be idempotent: they also run when this script adopts an already-running server,
+# which makes a plain re-run a repair pass. A failing hook is logged, never fatal — the
+# server is up, and one broken side process must not turn a good boot into a bad one.
+BOOT_HOOKS_DIR="${BOOT_HOOKS_DIR:-$STATE_DIR/boot.d}"
+BOOT_HOOK_TIMEOUT_S="${BOOT_HOOK_TIMEOUT_S:-60}"      # per hook; 0 = no limit
+
 # Scrub CLAUDE_* so the server is not detected as a nested agent (see lib.sh). Swept from
 # the live environment rather than hardcoded: a cold start is often driven from an agent
 # session, and the set of markers it exports grows over time (CLAUDECODE,
@@ -63,18 +81,22 @@ while IFS= read -r _v; do CLAUDE_SCRUB+=(-u "$_v"); done \
 SELF_SCRUB=()
 for _v in STATE_DIR ARCHON_UPGRADE_DIRS POINTER LIVE_PORT LIVE_PROC_PATTERN DEV_CMD \
   BIN_PATH_PREPEND SERVER_LOG READY_MARKER MESSENGER_READY_MARKER HEALTH_URL \
-  REQUIRE_PLATFORMS START_DEADLINE POST_START_CMD; do
+  REQUIRE_PLATFORMS START_DEADLINE POST_START_CMD BOOT_HOOKS_DIR BOOT_HOOK_TIMEOUT_S; do
   SELF_SCRUB+=(-u "$_v")
 done; unset _v
 
 MODE=start
-case "${1:-}" in
-  --detect-only|-n) MODE=detect ;;
-  --entrypoint)     MODE=entrypoint ;;
-  --help|-h)        sed -n '2,26p' "$0"; exit 0 ;;
-  "")               ;;
-  *)                echo "unknown argument: $1 (try --help)" >&2; exit 1 ;;
-esac
+RUN_HOOKS=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --detect-only|-n) MODE=detect ;;
+    --entrypoint)     MODE=entrypoint ;;
+    --no-hooks)       RUN_HOOKS=0 ;;
+    --help|-h)        sed -n '2,33p' "$0"; exit 0 ;;
+    *)                echo "unknown argument: $1 (try --help)" >&2; exit 1 ;;
+  esac
+  shift
+done
 
 ts(){ date -u +%H:%M:%S; }
 log(){ echo "[$(ts)] $*"; }
@@ -87,6 +109,40 @@ json_get(){ # $1 = file ; $2 = key
 }
 
 git_top(){ git -C "$1" rev-parse --show-toplevel 2>/dev/null; }
+
+# Active platform names from a health JSON blob on stdin, ';'-joined. Isolate the [...]
+# array first so the "activePlatforms" key itself is not captured (as lib.sh does).
+platforms_from_health(){
+  grep -oE '"activePlatforms"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
+    | grep -oE '\[[^]]*\]' | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | paste -sd';' -
+}
+
+# Run every executable in BOOT_HOOKS_DIR, in lexical order. Never fatal.
+run_boot_hooks(){
+  [ "${RUN_HOOKS:-1}" = 1 ] || { log "boot hooks skipped (--no-hooks)"; return 0; }
+  [ -d "$BOOT_HOOKS_DIR" ] || return 0
+  local hook rc had=0
+  for hook in "$BOOT_HOOKS_DIR"/*; do
+    [ -f "$hook" ] && [ -x "$hook" ] || continue
+    had=1
+    log "boot hook: $(basename "$hook")"
+    if [ "$BOOT_HOOK_TIMEOUT_S" != 0 ] && command -v timeout >/dev/null 2>&1; then
+      SERVER_URL="$HEALTH_URL" LIVE_PORT="$LIVE_PORT" LIVE_WT="$TARGET" \
+      SERVER_PGID="$PGID" ACTIVE_PLATFORMS="${PLATFORMS:-}" SERVER_LOG="$SERVER_LOG" \
+        timeout "$BOOT_HOOK_TIMEOUT_S" "$hook" 2>&1 | sed 's/^/    /'
+      rc=${PIPESTATUS[0]}
+      [ "$rc" = 124 ] && log "  WARN: $(basename "$hook") timed out after ${BOOT_HOOK_TIMEOUT_S}s"
+    else
+      SERVER_URL="$HEALTH_URL" LIVE_PORT="$LIVE_PORT" LIVE_WT="$TARGET" \
+      SERVER_PGID="$PGID" ACTIVE_PLATFORMS="${PLATFORMS:-}" SERVER_LOG="$SERVER_LOG" \
+        "$hook" 2>&1 | sed 's/^/    /'
+      rc=${PIPESTATUS[0]}
+    fi
+    [ "$rc" = 0 ] || log "  WARN: $(basename "$hook") exited $rc (continuing)"
+  done
+  [ "$had" = 1 ] || log "no boot hooks in $BOOT_HOOKS_DIR"
+}
+
 describe(){ # $1 = worktree
   printf '%s @ %s (%s)' "$1" \
     "$(git -C "$1" rev-parse --short HEAD 2>/dev/null || echo '?')" \
@@ -110,6 +166,7 @@ if [ -n "$RUNNING_PID" ]; then
   log "already serving: $(describe "${RUNNING_WT:-?}") (pgid ${RUNNING_PGID:-?})"
   [ "$MODE" = detect ] && exit 0
   PGID="$RUNNING_PGID"; TARGET="$RUNNING_WT"
+  PLATFORMS="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null | platforms_from_health)"
   ADOPTED=1
 fi
 
@@ -189,11 +246,7 @@ if [ -z "${ADOPTED:-}" ]; then
     *'"status":"ok"'*) : ;;
     *) log "  [gate] $HEALTH_URL did not report status:ok"; exit 2 ;;
   esac
-  # Isolate the [...] array first so the "activePlatforms" key itself is not captured
-  # (same extraction as lib.sh:_platforms_from_health).
-  PLATFORMS="$(printf '%s' "$HEALTH" \
-    | grep -oE '"activePlatforms"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
-    | grep -oE '\[[^]]*\]' | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | paste -sd';' -)"
+  PLATFORMS="$(printf '%s' "$HEALTH" | platforms_from_health)"
   if [ -n "$REQUIRE_PLATFORMS" ]; then
     missing=""
     IFS=';' read -ra want <<< "$REQUIRE_PLATFORMS"
@@ -214,6 +267,9 @@ if [ -z "${ADOPTED:-}" ]; then
   log "==== SERVING from $TARGET on :$LIVE_PORT (pgid $PGID) ===="
   [ -n "$POST_START_CMD" ] && { log "post-start: $POST_START_CMD"; eval "$POST_START_CMD" || log "WARN: POST_START_CMD exited non-zero"; }
 fi
+
+# The server is up (freshly started or adopted) — bring up whatever else this host expects.
+run_boot_hooks
 
 [ "$MODE" = entrypoint ] || exit 0
 

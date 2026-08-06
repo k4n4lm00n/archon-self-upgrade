@@ -91,9 +91,15 @@ those artifacts, boots the build that was live, and applies the same startup gat
 
 ```bash
 scripts/start-current.sh --detect-only   # print what it would start, change nothing
-scripts/start-current.sh                 # start it, gate it, then exit
+scripts/start-current.sh                 # start it, gate it, run boot hooks, then exit
 scripts/start-current.sh --entrypoint    # ... and stay in the foreground (service/container PID 1)
 ```
+
+Once the server is healthy it runs every executable in `$BOOT_HOOKS_DIR`
+(default `$ARCHON_HOME/.local/boot.d`) — the side processes a server does not own: pollers,
+sync daemons, tunnels. Each project installs one hook there, so what comes back after a
+restart is owned by the projects rather than by one host script. Hooks must be idempotent;
+they run on the adopt path too, which makes a bare re-run a repair pass.
 
 It is self-contained by design (no `lib.sh`), so it can be copied to a fixed path and used
 as an entrypoint on a host that has no toolkit checkout. See

@@ -100,9 +100,8 @@ roll back to on a cold start; that is the cutover's job).
 
 It reuses the toolkit's env-var names and defaults (`LIVE_PORT`, `DEV_CMD`,
 `BIN_PATH_PREPEND`, `READY_MARKER`, `MESSENGER_READY_MARKER`, `HEALTH_URL`,
-`REQUIRE_PLATFORMS`, `START_DEADLINE`), plus `POST_START_CMD` for anything else the host
-needs started once the server is healthy. It does **not** source `lib.sh`, so a single copy
-of the file is enough:
+`REQUIRE_PLATFORMS`, `START_DEADLINE`), plus `POST_START_CMD` for a one-off command. It does
+**not** source `lib.sh`, so a single copy of the file is enough:
 
 ```bash
 # deploy it next to your other host scripts — no privileged path, no root
@@ -115,6 +114,33 @@ the deployed copy on the same persistent volume as the run artifacts it reads. R
 
 Where the toolkit writes run artifacts to a scratch directory (`ARCHON_UPGRADE_DIR=/tmp/...`),
 put them somewhere that survives a restart — otherwise the cold start has nothing to read.
+
+### Boot hooks — what else comes back up
+
+A server restart also takes down everything *around* it: pollers, sync daemons, tunnels,
+watchdogs. Those are not the server's to restart, and a server generally has no way to be
+told about them. So once the health gate passes, `start-current.sh` runs every executable in
+`$BOOT_HOOKS_DIR` (default `$ARCHON_HOME/.local/boot.d`) in lexical order:
+
+```bash
+install -m 0755 boot.d/10-my-daemon.sh "${ARCHON_HOME:-$HOME/.archon}/.local/boot.d/"
+```
+
+A project registers itself by shipping one hook file and installing it — the set of things
+that must come back lives with the projects that own them, not in one host script that
+drifts. Contract:
+
+- **Idempotent.** Hooks also run when the script adopts an already-running server, so a bare
+  re-run doubles as a repair pass. Delegate to a launcher that checks a pidfile and exits 0
+  if the process is already up.
+- **Non-fatal.** A hook's failure is logged and the boot continues — the server is up, and
+  one broken side process must not turn a good boot into a bad one.
+- **Bounded.** Each hook is capped at `BOOT_HOOK_TIMEOUT_S` (default 60s, `0` disables), so a
+  hook that hangs cannot hang the boot.
+- **Env provided:** `SERVER_URL`, `LIVE_PORT`, `LIVE_WT`, `SERVER_PGID`, `ACTIVE_PLATFORMS`,
+  `SERVER_LOG`.
+
+`--no-hooks` starts the server alone.
 
 ## Common issues
 
