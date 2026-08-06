@@ -18,7 +18,9 @@ and the cutover settle/notify knobs. It also defines `run_health_gate` (the shar
 and [the rollback-constraints section](06-workflow.md#rollback-constraints-the-health-gate)
 (the scripts and the workflow share the same variables and gate logic).
 
-Helpers: `detect_live` (finds the live server's **pgid** + worktree via `LIVE_PROC_PATTERN`),
+Helpers: `live_pid` (the pid of the live server: a `LIVE_PROC_PATTERN` match whose
+`/proc/<pid>/comm` is `LIVE_PROC_COMM`, so a command line that merely *mentions* the pattern
+cannot be mistaken for the server), `detect_live` (its **pgid** + worktree),
 `write_scrubbed_env_file` (writes a credential-blanked copy of the env file for the smoke
 boot's `ARCHON_HOME`, blanking every name matching the credential pattern plus `SCRUB_ENV_VARS`),
 `state_get`, `port_busy`,

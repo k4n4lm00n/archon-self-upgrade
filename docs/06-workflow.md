@@ -76,6 +76,7 @@ All host specifics are env vars resolved in `preflight` and persisted to
 | `LIVE_PORT` / `SMOKE_PORT` | `3090` / `3091` | Live and isolated-smoke ports. |
 | `STAGE_WT` / `STAGE_BRANCH` | `~/worktrees/archon-upgrade-next` / `archon-upgrade-next` | Staging worktree/branch. |
 | `LIVE_PROC_PATTERN` | `bun --watch src/index.ts` | `pgrep` pattern to find the live server. |
+| `LIVE_PROC_COMM` | first word of `DEV_CMD` (`bun`) | `/proc/<pid>/comm` a match must have to count as the server — keeps a command line that merely mentions the pattern from being mistaken for it. |
 | `DEV_CMD` | `bun run dev` | Command to start the server. |
 | `INSTALL_CMD` / `TYPECHECK_CMD` / `BUILD_CMD` | `bun install` / `bun run type-check` / `bun run build` | Validation steps (empty = skip). |
 | `TEST_CMD` | *(empty)* | Optional test command, e.g. `bun test`. |

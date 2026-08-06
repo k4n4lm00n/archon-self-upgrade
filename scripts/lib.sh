@@ -27,6 +27,7 @@ STAGE_BRANCH="${STAGE_BRANCH:-archon-upgrade-next}"
 # ---- Commands (empty = skip that step) ----
 LIVE_PROC_PATTERN="${LIVE_PROC_PATTERN:-bun --watch src/index.ts}"
 DEV_CMD="${DEV_CMD:-bun run dev}"
+LIVE_PROC_COMM="${LIVE_PROC_COMM:-${DEV_CMD%% *}}"   # /proc/<pid>/comm of the real server
 INSTALL_CMD="${INSTALL_CMD:-bun install}"
 TYPECHECK_CMD="${TYPECHECK_CMD:-bun run type-check}"
 BUILD_CMD="${BUILD_CMD:-bun run build}"
@@ -71,7 +72,7 @@ CLAUDE_SCRUB=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
 # the smoke boot strip these so every server starts with a clean, config-free environment.
 SELFUPGRADE_SCRUB=()
 for _v in UPGRADE_DIR ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE TARGET_REF \
-  STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN DEV_CMD INSTALL_CMD TYPECHECK_CMD BUILD_CMD TEST_CMD \
+  STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD BUILD_CMD TEST_CMD \
   BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS \
   REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
   CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE NOTIFY_CMD OLD_PLATFORMS; do
@@ -111,9 +112,23 @@ write_scrubbed_env_file(){
   done < "$src" > "$dst"
 }
 
+# Resolve the pid of the live server. A command line can MENTION the pattern without being
+# the server — a shell running pgrep, an editor, the launcher of this very run. Anchoring
+# the rollback to one of those (or, worse, stopping its process group at cutover) would hit
+# the wrong tree, so require the match to actually be the server binary.
+live_pid() {
+  local p
+  for p in $(pgrep -f "$LIVE_PROC_PATTERN" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$LIVE_PROC_COMM" ] || continue
+    echo "$p"; return 0
+  done
+  return 1
+}
+
 detect_live() {
   local watch_pid cwd
-  watch_pid="$(pgrep -f "$LIVE_PROC_PATTERN" | head -1)"
+  watch_pid="$(live_pid)"
   [ -n "$watch_pid" ] || return 1
   cwd="$(readlink "/proc/$watch_pid/cwd" 2>/dev/null)"
   LIVE_PGID="$(ps -o pgid= -p "$watch_pid" | tr -d ' ')"

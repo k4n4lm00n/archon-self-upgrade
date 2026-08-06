@@ -118,9 +118,11 @@ put them somewhere that survives a restart — otherwise the cold start has noth
 
 ## Common issues
 
-- **`could not find a running 'bun --watch src/index.ts'`** — the server isn't up, or
-  runs under a different command. `01-snapshot` and cutover re-detection depend on that
-  process name (`lib.sh:detect_live`).
+- **`no live '<comm>' process matching '<pattern>'`** — the server isn't up, or runs under
+  a different command. `01-snapshot` and cutover re-detection need both a
+  `LIVE_PROC_PATTERN` match and `/proc/<pid>/comm` = `LIVE_PROC_COMM` (`lib.sh:live_pid`).
+  If your server runs under a different binary (a compiled build, a wrapper), set
+  `LIVE_PROC_COMM` to match.
 - **`CONFLICT carrying <sha>`** (02-stage, only with `CARRY_LIVE_COMMITS=1`) — a carried
   local commit conflicts with the target. Staging is left clean; resolve the conflict (or
   set `CARRY_LIVE_COMMITS=0` to deploy the target as-is) and re-run.

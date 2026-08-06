@@ -45,7 +45,9 @@ intact" and `3` as a page.
 ## Why the cutover must be detached
 
 `lib.sh:detect_live()` finds the live server by its `LIVE_PROC_PATTERN` (default
-`bun --watch src/index.ts`) and resolves its **process group id** (`pgid`). The cutover stops the whole
+`bun --watch src/index.ts`), confirms the match really is the server binary
+(`/proc/<pid>/comm` = `LIVE_PROC_COMM`, so a shell whose command line mentions the pattern
+is not mistaken for it), and resolves its **process group id** (`pgid`). The cutover stops the whole
 group with `kill -TERM -$pgid` — that group includes the shell the launching agent is
 running in. Therefore `05-cutover.sh` must be launched as:
 
@@ -106,7 +108,7 @@ All of these are env vars with defaults in `lib.sh` — nothing is hardcoded to 
 | Upgrade target | `TARGET_REF` | the fork's HEAD branch |
 | Remotes | `UPSTREAM_REMOTE`/`UPSTREAM_URL`, `FORK_REMOTE` | `upstream` / `coleam00/Archon`, `myfork` |
 | Ports | `LIVE_PORT` / `SMOKE_PORT` | `3090` / `3091` |
-| Live process match | `LIVE_PROC_PATTERN` | `bun --watch src/index.ts` |
+| Live process match | `LIVE_PROC_PATTERN` + `LIVE_PROC_COMM` | `bun --watch src/index.ts` + first word of `DEV_CMD` |
 | Toolchain PATH | `BIN_PATH_PREPEND` | `~/.bun/bin` |
 | Health gate | `CUTOVER_DEADLINE`, `HEALTH_URL`, `SKIP_PLATFORM_PARITY`, `REQUIRE_PLATFORMS`, `REQUIRE_LOG`, `FORBID_LOG`, `HEALTH_CMD`, `HEALTH_HOOK`, `CONFIRM_CMD`, `CONFIRM_TIMEOUT_S` | parity by default; see [06](06-workflow.md#rollback-constraints-the-health-gate) |
 | Adapter creds file | `ENV_FILE` | `~/.archon/.env` (sourced by cutover; never committed) |

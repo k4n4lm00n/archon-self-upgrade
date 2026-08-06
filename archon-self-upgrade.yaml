@@ -80,6 +80,7 @@ nodes:
 
       LIVE_PROC_PATTERN="${LIVE_PROC_PATTERN:-bun --watch src/index.ts}"
       DEV_CMD="${DEV_CMD:-bun run dev}"
+      LIVE_PROC_COMM="${LIVE_PROC_COMM:-${DEV_CMD%% *}}"  # /proc/<pid>/comm of the real server
       INSTALL_CMD="${INSTALL_CMD:-bun install}"
       TYPECHECK_CMD="${TYPECHECK_CMD:-bun run type-check}"
       BUILD_CMD="${BUILD_CMD:-bun run build}"
@@ -201,7 +202,7 @@ nodes:
       # ---- Persist config for later nodes ----
       {
         for v in UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE TARGET_REF LIVE_PORT SMOKE_PORT \
-                 STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN DEV_CMD INSTALL_CMD TYPECHECK_CMD \
+                 STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD \
                  BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
                  SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD \
                  HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
@@ -225,8 +226,17 @@ nodes:
       ART="$ARTIFACTS_DIR"; source "$ART/upgrade.env"
       die(){ echo "FATAL: $*" >&2; exit 1; }
 
-      WATCH_PID="$(pgrep -f "$LIVE_PROC_PATTERN" | head -1)"
-      [ -n "$WATCH_PID" ] || die "no live process matching '$LIVE_PROC_PATTERN' — is the server up?"
+      # A command line can MENTION the pattern without being the server (a shell running
+      # pgrep, an editor, this run's own launcher). Anchoring the rollback to one of those —
+      # or stopping its group at cutover — would hit the wrong process tree, so require the
+      # match to actually be the server binary. Identical to scripts/lib.sh:live_pid.
+      live_pid(){ local p; for p in $(pgrep -f "$LIVE_PROC_PATTERN" 2>/dev/null); do
+        [ "$p" = "$$" ] && continue
+        [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$LIVE_PROC_COMM" ] || continue
+        echo "$p"; return 0; done; return 1; }
+
+      WATCH_PID="$(live_pid)"
+      [ -n "$WATCH_PID" ] || die "no live '$LIVE_PROC_COMM' process matching '$LIVE_PROC_PATTERN' — is the server up?"
       CWD="$(readlink "/proc/$WATCH_PID/cwd" 2>/dev/null)"
       LIVE_PGID="$(ps -o pgid= -p "$WATCH_PID" | tr -d ' ')"
       LIVE_WT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)"
@@ -358,7 +368,7 @@ nodes:
         -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS -u CLAUDE_CODE_SESSION_ID)
       # Also strip this run's config vars so the child never carries them (matches the cutover).
       SELFUPGRADE_SCRUB=(); for _v in ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE \
-        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN DEV_CMD INSTALL_CMD TYPECHECK_CMD \
+        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD \
         BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
         SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK \
         CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE \
@@ -446,7 +456,7 @@ nodes:
       # This run's config vars must NOT leak into the long-lived server (a later upgrade, a
       # subprocess of it, would inherit e.g. a stale REQUIRE_LOG and misbehave). Strip them.
       SELFUPGRADE_SCRUB=(); for _v in ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE \
-        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN DEV_CMD INSTALL_CMD TYPECHECK_CMD \
+        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD \
         BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
         SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK \
         CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE \
@@ -456,6 +466,14 @@ nodes:
       log "health gate: parity=$([ "$SKIP_PLATFORM_PARITY" = 1 ] && echo off || echo "need[${REQUIRE_PLATFORMS:-$OLD_PLATFORMS}]") deadline=${CUTOVER_DEADLINE}s require_log=[$REQUIRE_LOG] forbid_log=[$FORBID_LOG] health_cmd=$([ -n "$HEALTH_CMD" ] && echo yes || echo no) confirm=$([ -n "$CONFIRM_CMD" ] && echo "yes(${CONFIRM_TIMEOUT_S}s)" || echo no)"
       status starting "settling ${CUTOVER_SETTLE}s"; sleep "$CUTOVER_SETTLE"
 
+      # A command line can MENTION the pattern without being the server (a shell running
+      # pgrep, an editor, this run's own launcher). Anchoring the rollback to one of those —
+      # or stopping its group at cutover — would hit the wrong process tree, so require the
+      # match to actually be the server binary. Identical to scripts/lib.sh:live_pid.
+      live_pid(){ local p; for p in $(pgrep -f "$LIVE_PROC_PATTERN" 2>/dev/null); do
+        [ "$p" = "$$" ] && continue
+        [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$LIVE_PROC_COMM" ] || continue
+        echo "$p"; return 0; done; return 1; }
       port_busy(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
       stop_group(){ kill -TERM -"$1" 2>/dev/null; for i in $(seq 1 15); do kill -0 -"$1" 2>/dev/null || return 0; sleep 1; done; kill -KILL -"$1" 2>/dev/null; }
       start_server(){ cd "$1" || return 1; setsid env "${CLAUDE_SCRUB[@]}" "${SELFUPGRADE_SCRUB[@]}" ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING=1 \
@@ -502,7 +520,7 @@ nodes:
 
       # Stop old (re-detect in case it restarted since snapshot; never orphan it).
       STOP_LIST="$OLD_PGID"
-      NP="$(pgrep -f "$LIVE_PROC_PATTERN" | head -1)"
+      NP="$(live_pid)"
       if [ -n "$NP" ]; then NPGID="$(ps -o pgid= -p "$NP" | tr -d ' ')"; [ -n "$NPGID" ] && [ "$NPGID" != "$OLD_PGID" ] && STOP_LIST="$OLD_PGID $NPGID"; fi
       status stopping "pgids: $STOP_LIST"
       for pg in $STOP_LIST; do log "stopping group $pg"; stop_group "$pg"; done
