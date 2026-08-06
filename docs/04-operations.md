@@ -72,6 +72,50 @@ setsid env PATH="$HOME/.bun/bin:$PATH" PORT=3090 bun run dev \
 grep -q server_ready /tmp/archon-manual.log   # wait for this (and your messenger marker, if any)
 ```
 
+## Cold start (after a host restart)
+
+The phases above assume a **running** server to swap. After a host or container restart
+there is none — and the only record of which worktree was serving is in the run artifacts.
+`scripts/start-current.sh` reads them and boots that build:
+
+```bash
+scripts/start-current.sh --detect-only   # print what it would start, change nothing
+scripts/start-current.sh                 # start + gate, then exit
+scripts/start-current.sh --entrypoint    # start + gate, then hold the foreground and
+                                         # forward SIGTERM/SIGINT to the server group
+```
+
+Detection order — first hit wins, it never guesses:
+
+1. **a server already running** → adopt it and exit 0, so re-running is harmless
+2. **`$POINTER`** (`$ARCHON_HOME/.local/current-live.json`) — rewritten on every healthy start
+3. **the newest `cutover-status.json`** under `$ARCHON_UPGRADE_DIRS` — `success` and
+   `rolled_back` both name the serving worktree in `detail`; any other phase falls back to
+   `live_worktree` in the sibling `state.json`
+
+If nothing resolves, or the resolved worktree is missing / not a worktree root / has no
+installed dependencies, it exits 1 **without starting anything**. Exit 2 means it started
+but did not pass the gate — the server is left running for inspection (there is nothing to
+roll back to on a cold start; that is the cutover's job).
+
+It reuses the toolkit's env-var names and defaults (`LIVE_PORT`, `DEV_CMD`,
+`BIN_PATH_PREPEND`, `READY_MARKER`, `MESSENGER_READY_MARKER`, `HEALTH_URL`,
+`REQUIRE_PLATFORMS`, `START_DEADLINE`), plus `POST_START_CMD` for anything else the host
+needs started once the server is healthy. It does **not** source `lib.sh`, so a single copy
+of the file is enough:
+
+```bash
+# deploy it next to your other host scripts — no privileged path, no root
+install -m 0755 scripts/start-current.sh "${ARCHON_HOME:-$HOME/.archon}/scripts/start-current-archon.sh"
+```
+
+A user-owned path is enough for a service unit or a container `--entrypoint`, and it keeps
+the deployed copy on the same persistent volume as the run artifacts it reads. Re-run the
+`install` after changing the script — the deployed copy is a copy, not a link.
+
+Where the toolkit writes run artifacts to a scratch directory (`ARCHON_UPGRADE_DIR=/tmp/...`),
+put them somewhere that survives a restart — otherwise the cold start has nothing to read.
+
 ## Common issues
 
 - **`could not find a running 'bun --watch src/index.ts'`** — the server isn't up, or

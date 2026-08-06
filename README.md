@@ -82,6 +82,23 @@ Phases 00–04 are **non-destructive** — they never touch the live server. Onl
 `05-cutover` is destructive, and it is self-healing: if the new build fails the **health gate**
 within the deadline, it restarts the **old worktree** (never modified) and confirms it is back.
 
+## Cold start (the other half)
+
+The pipeline **swaps** a running server. After a host or container restart there is nothing
+to swap: the process group is gone, and only the run artifacts remember which worktree was
+serving. [`scripts/start-current.sh`](scripts/start-current.sh) closes that gap — it reads
+those artifacts, boots the build that was live, and applies the same startup gate.
+
+```bash
+scripts/start-current.sh --detect-only   # print what it would start, change nothing
+scripts/start-current.sh                 # start it, gate it, then exit
+scripts/start-current.sh --entrypoint    # ... and stay in the foreground (service/container PID 1)
+```
+
+It is self-contained by design (no `lib.sh`), so it can be copied to a fixed path and used
+as an entrypoint on a host that has no toolkit checkout. See
+[docs/04-operations.md](docs/04-operations.md#cold-start-after-a-host-restart).
+
 ## Key design decisions
 
 | Decision | Why |
@@ -118,6 +135,7 @@ within the deadline, it restarts the **old worktree** (never modified) and confi
 ```
 archon-self-upgrade.yaml   the publishable Archon workflow (canonical)
 scripts/                   standalone toolkit — same model, run by hand (lib.sh, 00…05)
+scripts/start-current.sh   cold start: detect the last live build and boot it (entrypoint-ready)
 reference/                 sanitized example state files (runtime state.json is gitignored)
 docs/                      this documentation
 LICENSE                    MIT
