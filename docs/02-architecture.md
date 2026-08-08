@@ -95,9 +95,31 @@ examples. The rollback path re-validates the restored old build with the **defau
   with `ARCHON_HOME` pointing there. Each adapter gates on `Boolean(process.env.<cred>)`, so
   blank creds ⇒ no adapter starts, while DB/other config still load. No `HOME` override
   (Claude global auth keeps working); the scratch dir is removed on exit. Names no platform.
+  The credential pattern covers every v0.8 adapter gate — Telegram/Discord/Slack
+  (`*_BOT_TOKEN`/`*_APP_TOKEN`), GitHub App **and** PAT (the shared `WEBHOOK_SECRET`, so
+  `selectGitHubAuthMode` returns `none` rather than throwing), Gitea/GitLab
+  (`*_TOKEN` + `*_WEBHOOK_SECRET`), and Zulip (`ZULIP_BOT_EMAIL`, `ZULIP_BOT_API_KEY`).
+- **Server-only smoke boot (`SMOKE_DEV_CMD` / `smoke_dev_cmd`).** On the v0.8 monorepo
+  `bun run dev` = `bun --filter '*' dev`, which fans out to *server + web + docs* — i.e. a
+  second orchestrator/agent, not just the server under test. The smoke boot instead uses a
+  **server-only** command: `SMOKE_DEV_CMD` if set, else the staged package's own
+  `dev:server` script (`bun --filter @archon/server dev`) when present, else `DEV_CMD` for
+  older single-package layouts. This keeps the isolation boot to a single server process.
+- **Repo-scope env defense (v0.8 three-path model).** `loadArchonEnv()` also loads
+  `<cwd>/.archon/.env` (repo scope) with `override: true` **after** the scrubbed
+  `ARCHON_HOME/.env`, so a credentialed repo-scope file in the staging worktree would
+  re-enable adapters and defeat isolation. `04-smoke` scrubs that file in place for the boot
+  (`scrub_repo_env`) and restores it byte-for-byte on exit (`restore_repo_env`), leaving the
+  worktree unchanged so nothing leaks into the cutover.
+- **Isolation assertion.** After boot, `04-smoke` reads `/api/health` and requires
+  `activePlatforms == ["Web"]` — any messenger/forge there means an adapter connected (a
+  rogue bot), which fails the smoke gate hard.
 
   *(This was found the hard way during the live dry run — env-var stripping and a repo-scope
-  `.env` both failed because the server force-reloads its env file; see docs/05.)*
+  `.env` both failed because the server force-reloads its env file; see docs/05. The
+  server-only command, the repo-scope defense, and the `activePlatforms == ["Web"]`
+  assertion were added after a v0.8 regression where `bun run dev` fanned out and spawned a
+  second bot.)*
 
 ## Host settings (env-overridable defaults)
 

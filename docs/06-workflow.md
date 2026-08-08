@@ -40,9 +40,14 @@ preflight ─▶ snapshot ─▶ stage ─▶ validate ─▶ smoke ─▶ cutov
 automated smoke gate plus the self-healing cutover are the safety mechanism.
 
 ### How "is staging fine?" is checked automatically (no human gate)
-- **`smoke`** boots the staged build on `SMOKE_PORT` under a scrubbed `ARCHON_HOME` (a
-  credential-blanked copy of the env file, so no adapter starts) and waits for `READY_MARKER`
-  + an HTTP response. Connects to nothing; proves the build runs.
+- **`smoke`** boots the staged build on `SMOKE_PORT` **server-only** (`SMOKE_DEV_CMD`, else
+  the staged `dev:server` script, else `DEV_CMD` — so the v0.8 `bun run dev` does **not**
+  fan out to web/docs/a second orchestrator) under a scrubbed `ARCHON_HOME` (a
+  credential-blanked copy of the env file, so no adapter starts). It also scrubs any
+  credentialed repo-scope `<worktree>/.archon/.env` for the boot and restores it afterward
+  (the v0.8 three-path env model loads it with `override:true`). Then it waits for
+  `READY_MARKER` + an HTTP response and asserts `activePlatforms == ["Web"]`. Connects to
+  nothing; proves the build runs **and** is isolated.
 - **`cutover`** applies the **health gate** (see [Rollback constraints](#rollback-constraints-the-health-gate)):
   by default the new build must reach `READY_MARKER` **and** its health endpoint must report the
   same set of active platforms the old server had (**platform parity**). If the gate fails within
@@ -77,7 +82,8 @@ All host specifics are env vars resolved in `preflight` and persisted to
 | `STAGE_WT` / `STAGE_BRANCH` | `~/worktrees/archon-upgrade-next` / `archon-upgrade-next` | Staging worktree/branch. |
 | `LIVE_PROC_PATTERN` | `bun --watch src/index.ts` | `pgrep` pattern to find the live server. |
 | `LIVE_PROC_COMM` | first word of `DEV_CMD` (`bun`) | `/proc/<pid>/comm` a match must have to count as the server — keeps a command line that merely mentions the pattern from being mistaken for it. |
-| `DEV_CMD` | `bun run dev` | Command to start the server. |
+| `DEV_CMD` | `bun run dev` | Command to start the server (used by cutover). |
+| `SMOKE_DEV_CMD` | *(empty → auto)* | **Server-only** start for the isolated smoke boot. Empty auto-picks the staged `dev:server` script (`bun --filter @archon/server dev`) when present, else `DEV_CMD`. Set explicitly to override. Prevents the v0.8 `bun run dev` (= `bun --filter '*' dev`) from fanning out to web/docs/a second orchestrator. |
 | `INSTALL_CMD` / `TYPECHECK_CMD` / `BUILD_CMD` | `bun install` / `bun run type-check` / `bun run build` | Validation steps (empty = skip). |
 | `TEST_CMD` | *(empty)* | Optional test command, e.g. `bun test`. |
 | `BIN_PATH_PREPEND` | `~/.bun/bin` | Prepended to `PATH` for server/validate. |

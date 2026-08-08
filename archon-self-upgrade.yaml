@@ -81,6 +81,11 @@ nodes:
       LIVE_PROC_PATTERN="${LIVE_PROC_PATTERN:-bun --watch src/index.ts}"
       DEV_CMD="${DEV_CMD:-bun run dev}"
       LIVE_PROC_COMM="${LIVE_PROC_COMM:-${DEV_CMD%% *}}"  # /proc/<pid>/comm of the real server
+      # Server-ONLY start for the isolated smoke boot. On the v0.8 monorepo `bun run dev` =
+      # `bun --filter '*' dev` fans out to server+web+docs (a second orchestrator/agent), which
+      # must not happen during an isolation test. Empty => the smoke node auto-picks the staged
+      # package's `dev:server` script when present, else DEV_CMD (older single-package layouts).
+      SMOKE_DEV_CMD="${SMOKE_DEV_CMD:-}"
       INSTALL_CMD="${INSTALL_CMD:-bun install}"
       TYPECHECK_CMD="${TYPECHECK_CMD:-bun run type-check}"
       BUILD_CMD="${BUILD_CMD:-bun run build}"
@@ -202,7 +207,7 @@ nodes:
       # ---- Persist config for later nodes ----
       {
         for v in UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE TARGET_REF LIVE_PORT SMOKE_PORT \
-                 STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD \
+                 STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD \
                  BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
                  SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD \
                  HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
@@ -368,7 +373,7 @@ nodes:
         -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS -u CLAUDE_CODE_SESSION_ID)
       # Also strip this run's config vars so the child never carries them (matches the cutover).
       SELFUPGRADE_SCRUB=(); for _v in ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE \
-        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD \
+        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD \
         BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
         SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK \
         CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE \
@@ -378,12 +383,15 @@ nodes:
       # with override:true, so point ARCHON_HOME at a scratch dir holding a credential-blanked
       # COPY of the env file. Every adapter's presence-gate (Boolean(env.X)) then goes false =>
       # no adapter starts, while DB/other config still load. No HOME override (Claude global auth
-      # keeps working), nothing written into the worktree, so nothing can leak into the cutover.
+      # keeps working). Every v0.8 adapter gates on a credential-pattern var, so blanking them all
+      # disables each: Telegram/Discord/Slack (*_BOT_TOKEN/*_APP_TOKEN), GitHub App+PAT (shared
+      # WEBHOOK_SECRET -> selectGitHubAuthMode 'none'), Gitea/GitLab (*_TOKEN + *_WEBHOOK_SECRET),
+      # Zulip (ZULIP_BOT_EMAIL, ZULIP_BOT_API_KEY).
       CRED_RE='(TOKEN|SECRET|API_?KEY|WEBHOOK|PASSWORD|PASSWD|CREDENTIAL|BOT_|_BOT)'
-      SMOKE_ARCHON_HOME="$ART/smoke-archon"; rm -rf "$SMOKE_ARCHON_HOME"; mkdir -p "$SMOKE_ARCHON_HOME"
-      : > "$SMOKE_ARCHON_HOME/.env"
-      if [ -f "$ENV_FILE" ]; then
-        extra=" $SCRUB_ENV_VARS "
+      # Copy env file $1 -> $2, blanking the VALUE of every credential-like var (+ SCRUB_ENV_VARS).
+      scrub_env_file(){
+        local src="$1" dst="$2" line name extra=" $SCRUB_ENV_VARS "
+        [ -f "$src" ] || { : > "$dst"; return 0; }
         while IFS= read -r line || [ -n "$line" ]; do
           case "$line" in
             ''|\#*) printf '%s\n' "$line" ;;
@@ -393,16 +401,37 @@ nodes:
                 printf '%s=\n' "$name"; else printf '%s\n' "$line"; fi ;;
             *) printf '%s\n' "$line" ;;
           esac
-        done < "$ENV_FILE" > "$SMOKE_ARCHON_HOME/.env"
-      fi
+        done < "$src" > "$dst"
+      }
+      SMOKE_ARCHON_HOME="$ART/smoke-archon"; rm -rf "$SMOKE_ARCHON_HOME"; mkdir -p "$SMOKE_ARCHON_HOME"
+      scrub_env_file "$ENV_FILE" "$SMOKE_ARCHON_HOME/.env"
       echo "smoke isolation: ARCHON_HOME=$SMOKE_ARCHON_HOME ($(grep -cE '=$' "$SMOKE_ARCHON_HOME/.env") creds blanked)"
 
-      echo "booting staged build on :$SMOKE_PORT (adapters disabled via scrubbed ARCHON_HOME) ..."
+      # v0.8 three-path env model defense: loadArchonEnv() loads <cwd>/.archon/.env (repo scope)
+      # with override:true AFTER the scrubbed ARCHON_HOME/.env, so a credentialed repo-scope file
+      # in the staging worktree would re-enable adapters. Scrub it in place for the boot; restore
+      # it byte-for-byte in cleanup so the worktree ends unchanged (nothing leaks to cutover).
+      REPO_ENV="$STAGE_WT/.archon/.env"; REPO_ENV_BAK=""
+      if [ -f "$REPO_ENV" ]; then
+        REPO_ENV_BAK="$(mktemp)"; cp "$REPO_ENV" "$REPO_ENV_BAK"
+        scrub_env_file "$REPO_ENV_BAK" "$REPO_ENV"
+        echo "smoke isolation: scrubbed repo-scope $REPO_ENV for the boot (restored on exit)"
+      fi
+
+      # Server-ONLY start: on the v0.8 monorepo `bun run dev` = `bun --filter '*' dev` fans out to
+      # server+web+docs (a second orchestrator). Use SMOKE_DEV_CMD if set, else the staged package's
+      # own dev:server script when present, else DEV_CMD (older single-package layouts).
+      if [ -n "$SMOKE_DEV_CMD" ]; then SMOKE_CMD="$SMOKE_DEV_CMD"
+      elif [ -f "$STAGE_WT/package.json" ] && grep -Eq '"dev:server"[[:space:]]*:' "$STAGE_WT/package.json"; then SMOKE_CMD="bun run dev:server"
+      else SMOKE_CMD="$DEV_CMD"; fi
+
+      echo "booting staged build on :$SMOKE_PORT (server-only: '$SMOKE_CMD'; adapters disabled via scrubbed ARCHON_HOME) ..."
       setsid env "${CLAUDE_SCRUB[@]}" "${SELFUPGRADE_SCRUB[@]}" ARCHON_HOME="$SMOKE_ARCHON_HOME" \
         ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING=1 PATH="$BIN_PATH_PREPEND:$PATH" PORT="$SMOKE_PORT" \
-        $DEV_CMD </dev/null >"$SMOKE_LOG" 2>&1 &
+        $SMOKE_CMD </dev/null >"$SMOKE_LOG" 2>&1 &
       SMOKE_PGID="$!"
-      cleanup(){ kill -TERM -"$SMOKE_PGID" 2>/dev/null; kill -KILL -"$SMOKE_PGID" 2>/dev/null; rm -rf "$SMOKE_ARCHON_HOME"; }
+      restore_repo_env(){ [ -n "$REPO_ENV_BAK" ] && { cp "$REPO_ENV_BAK" "$REPO_ENV" 2>/dev/null || true; rm -f "$REPO_ENV_BAK"; REPO_ENV_BAK=""; }; }
+      cleanup(){ kill -TERM -"$SMOKE_PGID" 2>/dev/null; kill -KILL -"$SMOKE_PGID" 2>/dev/null; restore_repo_env; rm -rf "$SMOKE_ARCHON_HOME"; }
       trap cleanup EXIT
 
       ok=0
@@ -416,7 +445,15 @@ nodes:
       code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SMOKE_PORT/" 2>/dev/null)"
       echo "HTTP / -> $code"
       case "$code" in 2*|3*|4*) echo "HTTP responding" ;; *) die "no HTTP response on :$SMOKE_PORT" ;; esac
-      echo "=== SMOKE OK — staged build boots and serves; tearing down ==="
+
+      # Isolation assertion: with every credential blanked the ONLY active platform must be Web.
+      # Any messenger/forge here means an adapter connected (queue theft / a rogue bot) — fail hard.
+      platforms="$(curl -s --max-time 5 "http://127.0.0.1:$SMOKE_PORT/api/health" 2>/dev/null \
+        | grep -oE '"activePlatforms"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -oE '\[[^]]*\]' \
+        | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | paste -sd';' -)"
+      echo "activePlatforms: [${platforms}]"
+      [ "$platforms" = "Web" ] || die "smoke NOT isolated — activePlatforms=[${platforms}] (expected [Web]); an adapter connected"
+      echo "=== SMOKE OK — staged build boots, serves, and is isolated (Web only); tearing down ==="
 
   # ═══════════════════════════════════════════════════════════════════════════
   # PHASE 5 — CUTOVER: destructive, self-healing. Launched DETACHED because it
@@ -456,7 +493,7 @@ nodes:
       # This run's config vars must NOT leak into the long-lived server (a later upgrade, a
       # subprocess of it, would inherit e.g. a stale REQUIRE_LOG and misbehave). Strip them.
       SELFUPGRADE_SCRUB=(); for _v in ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE \
-        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD \
+        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD \
         BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
         SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK \
         CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE \

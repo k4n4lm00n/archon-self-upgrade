@@ -28,6 +28,12 @@ STAGE_BRANCH="${STAGE_BRANCH:-archon-upgrade-next}"
 LIVE_PROC_PATTERN="${LIVE_PROC_PATTERN:-bun --watch src/index.ts}"
 DEV_CMD="${DEV_CMD:-bun run dev}"
 LIVE_PROC_COMM="${LIVE_PROC_COMM:-${DEV_CMD%% *}}"   # /proc/<pid>/comm of the real server
+# Server-ONLY start command for the isolated smoke boot. On the v0.8 monorepo `bun run dev`
+# expands to `bun --filter '*' dev`, which fans out to server + web + docs (a second
+# orchestrator/agent) — that must NOT happen during an isolation test. Empty => auto-resolved
+# by smoke_dev_cmd() to the staged package's own `dev:server` script when present, else DEV_CMD
+# (older single-package layouts). Env-overridable.
+SMOKE_DEV_CMD="${SMOKE_DEV_CMD:-}"
 INSTALL_CMD="${INSTALL_CMD:-bun install}"
 TYPECHECK_CMD="${TYPECHECK_CMD:-bun run type-check}"
 BUILD_CMD="${BUILD_CMD:-bun run build}"
@@ -72,7 +78,7 @@ CLAUDE_SCRUB=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
 # the smoke boot strip these so every server starts with a clean, config-free environment.
 SELFUPGRADE_SCRUB=()
 for _v in UPGRADE_DIR ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE TARGET_REF \
-  STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD INSTALL_CMD TYPECHECK_CMD BUILD_CMD TEST_CMD \
+  STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD BUILD_CMD TEST_CMD \
   BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS \
   REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
   CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE NOTIFY_CMD OLD_PLATFORMS; do
@@ -90,7 +96,45 @@ die(){ echo "[$(ts)] FATAL: $*" >&2; exit 1; }
 # is false => no adapter starts, while DB/other config still load. No HOME override (Claude
 # global auth via ~/.claude still works), no file left in the worktree (nothing to leak into the
 # cutover). Names no platform.
+#
+# Every v0.8 adapter gates on at least one credential-pattern var, so blanking them all disables
+# each one: Telegram/Discord/Slack (*_BOT_TOKEN / *_APP_TOKEN), GitHub App+PAT (WEBHOOK_SECRET,
+# GITHUB_TOKEN — blanking the shared WEBHOOK_SECRET forces selectGitHubAuthMode -> 'none', not a
+# throw), Gitea/GitLab (*_TOKEN + *_WEBHOOK_SECRET), Zulip (ZULIP_BOT_EMAIL, ZULIP_BOT_API_KEY).
 _CRED_NAME_RE='(TOKEN|SECRET|API_?KEY|WEBHOOK|PASSWORD|PASSWD|CREDENTIAL|BOT_|_BOT)'
+
+# Resolve the server-ONLY start command for the smoke boot (see SMOKE_DEV_CMD). Honors an
+# explicit SMOKE_DEV_CMD override; else uses `bun run dev:server` when the staged package.json
+# defines it (the v0.8 monorepo server-only script), else falls back to DEV_CMD (older layouts
+# where `bun run dev` already started only the server).
+smoke_dev_cmd(){
+  if [ -n "${SMOKE_DEV_CMD:-}" ]; then printf '%s' "$SMOKE_DEV_CMD"; return 0; fi
+  if [ -f "$STAGE_WT/package.json" ] && grep -Eq '"dev:server"[[:space:]]*:' "$STAGE_WT/package.json"; then
+    printf 'bun run dev:server'
+  else
+    printf '%s' "$DEV_CMD"
+  fi
+}
+
+# v0.8 three-path env model defense. loadArchonEnv() loads `<cwd>/.archon/.env` (repo scope)
+# with override:true AFTER the scrubbed ARCHON_HOME/.env, so a credentialed repo-scope file in
+# the staging worktree would UN-blank adapters and defeat the isolation. Scrub it in place for
+# the boot and restore it byte-for-byte afterward (worktree ends unchanged => nothing leaks to
+# cutover). Sets REPO_ENV_BAK (empty when there was no repo-scope env); pair with restore_repo_env
+# in the smoke cleanup trap.
+REPO_ENV_BAK=""
+scrub_repo_env(){
+  local repo_env="$1/.archon/.env"
+  REPO_ENV_BAK=""
+  [ -f "$repo_env" ] || return 0
+  REPO_ENV_BAK="$(mktemp)"; cp "$repo_env" "$REPO_ENV_BAK"
+  write_scrubbed_env_file "$REPO_ENV_BAK" "$repo_env"
+}
+restore_repo_env(){
+  [ -n "${REPO_ENV_BAK:-}" ] || return 0
+  cp "$REPO_ENV_BAK" "$1/.archon/.env" 2>/dev/null || true
+  rm -f "$REPO_ENV_BAK"; REPO_ENV_BAK=""
+}
 
 # Copy env file $1 to $2, blanking the VALUE of every credential-like variable (plus any
 # SCRUB_ENV_VARS) and keeping all other lines verbatim.
