@@ -16,12 +16,16 @@
 #                                    SIGTERM/SIGINT to the server group
 #   start-current.sh --no-hooks      skip the boot hooks (server only)
 #
-# Detection order — first hit wins, it never guesses:
+# Detection — it never guesses:
 #   1. a server already running          -> adopt it (idempotent, safe to re-run)
 #   2. $POINTER                          -> written on every healthy start by this script
+#                                           (and, since 2026-09-12, by 05-cutover.sh)
 #   3. newest cutover-status.json under $ARCHON_UPGRADE_DIRS
 #      `success` / `rolled_back` name the serving worktree in `detail`; any other phase
 #      falls back to `live_worktree` in the sibling state.json
+#   When both 2 and 3 exist the NEWER record wins (pointer `started_utc` vs status `utc`):
+#   older cutovers swapped the server without rewriting the pointer, so after an upgrade
+#   the pointer named the build that was live BEFORE it and a cold start booted that.
 #
 # Once the server is healthy, every executable in $BOOT_HOOKS_DIR runs in lexical order:
 # the side processes the server does not own (pollers, sync daemons, tunnels). Each project
@@ -177,31 +181,47 @@ if [ -z "${ADOPTED:-}" ]; then
   fi
 
   # --- 2. pointer ---------------------------------------------------------------------
-  TARGET="$(json_get "$POINTER" worktree)"
-  [ -n "$TARGET" ] && SOURCE="pointer $POINTER"
+  P_TARGET="$(json_get "$POINTER" worktree)"
+  P_UTC="$(json_get "$POINTER" started_utc)"
 
   # --- 3. newest cutover-status.json --------------------------------------------------
-  if [ -z "$TARGET" ]; then
-    NEWEST=""
-    # shellcheck disable=SC2086 # ARCHON_UPGRADE_DIRS is a deliberate glob list
-    for d in $ARCHON_UPGRADE_DIRS; do
-      [ -f "$d/cutover-status.json" ] || continue
-      u="$(json_get "$d/cutover-status.json" utc)"
-      NEWEST="$(printf '%s\t%s\n%s' "${u:-0000}" "$d" "$NEWEST" | sort -r | head -1)"
-    done
-    RUN_DIR="${NEWEST#*$'\t'}"
-    if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
-      PHASE="$(json_get "$RUN_DIR/cutover-status.json" phase)"
-      case "$PHASE" in
-        success|rolled_back)
-          # both details read "... from <worktree> (pgid N)"
-          TARGET="$(json_get "$RUN_DIR/cutover-status.json" detail | sed -nE 's|.* from (/[^ ]+).*|\1|p')" ;;
-        *)
-          TARGET="$(json_get "$RUN_DIR/state.json" live_worktree)"
-          [ -n "$TARGET" ] && log "WARN: last cutover ended '$PHASE'; falling back to the pre-cutover build" ;;
-      esac
-      [ -n "$TARGET" ] && SOURCE="$RUN_DIR/cutover-status.json (phase=$PHASE)"
+  # Scanned even when the pointer exists (see the header: the newer record wins).
+  C_TARGET=""; C_UTC=""; C_SOURCE=""
+  NEWEST=""
+  # shellcheck disable=SC2086 # ARCHON_UPGRADE_DIRS is a deliberate glob list
+  for d in $ARCHON_UPGRADE_DIRS; do
+    [ -f "$d/cutover-status.json" ] || continue
+    u="$(json_get "$d/cutover-status.json" utc)"
+    NEWEST="$(printf '%s\t%s\n%s' "${u:-0000}" "$d" "$NEWEST" | sort -r | head -1)"
+  done
+  RUN_DIR="${NEWEST#*$'\t'}"
+  if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
+    PHASE="$(json_get "$RUN_DIR/cutover-status.json" phase)"
+    C_UTC="$(json_get "$RUN_DIR/cutover-status.json" utc)"
+    case "$PHASE" in
+      success|rolled_back)
+        # both details read "... from <worktree> (pgid N)"
+        C_TARGET="$(json_get "$RUN_DIR/cutover-status.json" detail | sed -nE 's|.* from (/[^ ]+).*|\1|p')" ;;
+      *)
+        C_TARGET="$(json_get "$RUN_DIR/state.json" live_worktree)"
+        [ -n "$C_TARGET" ] && log "WARN: last cutover ended '$PHASE'; its pre-cutover build is the candidate" ;;
+    esac
+    [ -n "$C_TARGET" ] && C_SOURCE="$RUN_DIR/cutover-status.json (phase=$PHASE, utc=${C_UTC:-?})"
+  fi
+
+  # --- pick: the newer of the two records (ISO-8601 UTC strings sort lexically) --------
+  TARGET=""; SOURCE=""
+  if [ -n "$P_TARGET" ] && [ -n "$C_TARGET" ]; then
+    if [[ "${C_UTC:-0}" > "${P_UTC:-0}" ]]; then
+      log "pointer names $P_TARGET (${P_UTC:-?}) but a newer cutover record exists (${C_UTC:-?}) — using the cutover record"
+      TARGET="$C_TARGET"; SOURCE="$C_SOURCE"
+    else
+      TARGET="$P_TARGET"; SOURCE="pointer $POINTER (started_utc=${P_UTC:-?}; newest cutover ${C_UTC:-none} is not newer)"
     fi
+  elif [ -n "$P_TARGET" ]; then
+    TARGET="$P_TARGET"; SOURCE="pointer $POINTER"
+  else
+    TARGET="$C_TARGET"; SOURCE="$C_SOURCE"
   fi
 
   [ -n "$TARGET" ] || die "could not detect the last live build (looked at $POINTER and $ARCHON_UPGRADE_DIRS) — start it by hand once, or set POINTER"

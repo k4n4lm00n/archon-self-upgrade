@@ -28,6 +28,16 @@ log "==== cutover started (pid $$) ===="
 log "old: $OLD_WT (pgid $OLD_PGID)  ->  new: $STAGE_WT"
 log "health gate: parity=$([ "$SKIP_PLATFORM_PARITY" = 1 ] && echo off || echo "require[${REQUIRE_PLATFORMS:-$OLD_PLATFORMS}]") deadline=${CUTOVER_DEADLINE}s require_log=[${REQUIRE_LOG}] forbid_log=[${FORBID_LOG}] health_cmd=$([ -n "$HEALTH_CMD" ] && echo yes || echo no) confirm=$([ -n "$CONFIRM_CMD" ] && echo "yes(${CONFIRM_TIMEOUT_S}s)" || echo no)"
 write_status(){ echo "{\"phase\":\"$1\",\"detail\":\"$2\",\"utc\":\"$(date -u +%FT%TZ)\"}" > "$STATUS"; }
+# The cold-start script (start-current.sh) reads $POINTER before the cutover records; keep
+# it pointed at whatever this run leaves serving, or the next cold start boots the OLD build.
+POINTER="${POINTER:-$HOME/.archon/.local/current-live.json}"
+write_pointer(){ # $1 = worktree ; $2 = pgid
+  mkdir -p "$(dirname "$POINTER")" 2>/dev/null
+  printf '{"worktree":"%s","branch":"%s","sha":"%s","pgid":"%s","port":"%s","platforms":"%s","started_utc":"%s"}\n' \
+    "$1" "$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null)" "$(git -C "$1" rev-parse HEAD 2>/dev/null)" \
+    "$2" "$LIVE_PORT" "$(capture_platforms "$LIVE_PORT")" "$(date -u +%FT%TZ)" > "$POINTER" \
+    && log "pointer $POINTER -> $1" || log "WARN: could not write pointer $POINTER"
+}
 notify(){ [ -n "$NOTIFY_CMD" ] && eval "$NOTIFY_CMD \"archon-self-upgrade: $1\"" || true; }
 
 write_status starting "settling ${CUTOVER_SETTLE}s"
@@ -70,6 +80,7 @@ write_status checking "applying health gate to new build"
 
 if run_health_gate "$NEW_LOG" full; then
   write_status success "new build live from $STAGE_WT (pgid $NEW_PGID)"
+  write_pointer "$STAGE_WT" "$NEW_PGID"
   log "==== CUTOVER SUCCESS — new build serving on :$LIVE_PORT ===="
   notify "SUCCESS — now serving from $STAGE_WT on :$LIVE_PORT"
   exit 0
@@ -86,6 +97,7 @@ RB_PGID="$(start_server "$OLD_WT" "$OLD_LOG")"
 log "old server relaunched from $OLD_WT (pgid $RB_PGID)"
 if run_health_gate "$OLD_LOG" basic; then
   write_status rolled_back "link restored from $OLD_WT (pgid $RB_PGID); upgrade aborted"
+  write_pointer "$OLD_WT" "$RB_PGID"
   log "==== ROLLBACK OK — original build restored, link back ===="
   notify "ROLLED BACK — new build failed the health gate, original restored, link back"
   exit 2
