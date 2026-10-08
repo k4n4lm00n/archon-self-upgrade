@@ -45,6 +45,15 @@ STATE_DIR="${STATE_DIR:-$ARCHON_HOME/.local}"
 ARCHON_UPGRADE_DIRS="${ARCHON_UPGRADE_DIRS:-$STATE_DIR/upgrade-runs/* $STATE_DIR/upgrade}"
 POINTER="${POINTER:-$STATE_DIR/current-live.json}"
 
+# ---- Known-good manifest: the blessed feature stack to boot (read-only here) -----------
+# Pins worktree+branch+sha of the full composite build and a git bundle that is the only
+# off-worktree copy of it. `ensure_stack` (below) repairs a drifted/clobbered worktree to
+# this sha before a cold start, so what boots is always the complete set of our changes
+# rather than whatever the worktree happens to hold. Promotion of this manifest is a
+# DELIBERATE act (bless-known-good.sh / a confirmed cutover) — this script never advances
+# it, so a rollback target can never silently drift onto a broken build.
+MANIFEST="${MANIFEST:-$STATE_DIR/known-good.json}"
+
 # ---- Launch (same names/defaults as lib.sh) ----
 LIVE_PORT="${LIVE_PORT:-3090}"
 LIVE_PROC_PATTERN="${LIVE_PROC_PATTERN:-bun --watch src/index.ts}"
@@ -152,6 +161,58 @@ describe(){ # $1 = worktree
     "$(git -C "$1" rev-parse --short HEAD 2>/dev/null || echo '?')" \
     "$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 }
+
+# Repair the manifest worktree to the blessed known-good sha before a cold start, so a
+# drifted / autosync-clobbered / partially-reset checkout is restored to the FULL feature
+# stack instead of booted as-is. Hydrates the object from the manifest's git bundle if the
+# worktree lost it. FAIL-OPEN by design: every problem logs a WARN and returns 0 — it must
+# never turn a boot that would otherwise succeed into a failure. Skipped on --detect-only
+# and whenever a server already answers health (the live server owns its worktree; we never
+# reset underneath a running build). Notifications are left to the rollback watcher daemon
+# so this script stays self-contained.
+ensure_stack(){
+  [ "${ENSURE_STACK:-1}" = 1 ] || { log "ensure-stack: disabled (ENSURE_STACK=0)"; return 0; }
+  [ "$MODE" = detect ] && return 0
+  [ -f "$MANIFEST" ] || { log "ensure-stack: no manifest at $MANIFEST — skipping"; return 0; }
+  if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
+    log "ensure-stack: a server already answers $HEALTH_URL — leaving the worktree untouched"; return 0
+  fi
+  local wt br sha bnd cur
+  wt="$(json_get "$MANIFEST" worktree)"; br="$(json_get "$MANIFEST" branch)"
+  sha="$(json_get "$MANIFEST" sha)";     bnd="$(json_get "$MANIFEST" bundle)"
+  [ -n "$wt" ] && [ -n "$sha" ] || { log "ensure-stack: manifest missing worktree/sha — skipping"; return 0; }
+  [ "$(git_top "$wt" 2>/dev/null)" = "$wt" ] || { log "ensure-stack: WARN $wt is not a git worktree root — skipping repair"; return 0; }
+  cur="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  # --untracked-files=no: reset --hard only governs TRACKED content, so stray untracked
+  # files (build artifacts, a scratch .env) must not force a needless re-reset on re-run.
+  if [ "$cur" = "$sha" ] && [ -z "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    log "ensure-stack: $wt already at known-good ${sha:0:10} (clean)"; return 0
+  fi
+  if [ "$cur" = "$sha" ]; then
+    log "ensure-stack: $wt at known-good but working tree dirty — hard-resetting"
+  else
+    log "ensure-stack: $wt at ${cur:-<none>} != known-good ${sha:0:10} — restoring"
+  fi
+  if ! git -C "$wt" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    if [ -n "$bnd" ] && [ -f "$bnd" ]; then
+      log "ensure-stack: hydrating ${sha:0:10} from bundle $bnd"
+      # side namespace: fetching into refs/heads/* is refused for the checked-out branch;
+      # we only need the objects reachable, then checkout -B pins the branch to the sha.
+      git -C "$wt" fetch -q "$bnd" "+refs/heads/*:refs/known-good/*" 2>&1 | sed 's/^/    /' || true
+    fi
+  fi
+  if ! git -C "$wt" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    log "ensure-stack: WARN ${sha:0:10} not in repo and not recoverable from bundle ($bnd) — booting whatever detection finds"; return 0
+  fi
+  git -C "$wt" checkout -q -B "${br:-detached-known-good}" "$sha" 2>&1 | sed 's/^/    /' \
+    || { log "ensure-stack: WARN 'checkout -B ${br} $sha' failed — leaving worktree as-is"; return 0; }
+  git -C "$wt" reset -q --hard "$sha" 2>&1 | sed 's/^/    /' \
+    || { log "ensure-stack: WARN 'reset --hard $sha' failed"; return 0; }
+  log "ensure-stack: restored $wt to ${br:-?} @ ${sha:0:10}"
+}
+
+# Bring the known-good stack onto disk first; detection then finds the repaired worktree.
+ensure_stack
 
 # --- 1. already running? -------------------------------------------------------------
 # A command line can MENTION the pattern without being the server — a shell running pgrep,
