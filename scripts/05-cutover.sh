@@ -81,6 +81,9 @@ write_status checking "applying health gate to new build"
 if run_health_gate "$NEW_LOG" full; then
   write_status success "new build live from $STAGE_WT (pgid $NEW_PGID)"
   write_pointer "$STAGE_WT" "$NEW_PGID"
+  # The new build passed the FULL gate — promote it to the known-good floor (manifest +
+  # bundle) so a later cold start / rollback restores THIS build, not the pre-upgrade one.
+  write_known_good "$STAGE_WT"
   log "==== CUTOVER SUCCESS — new build serving on :$LIVE_PORT ===="
   notify "SUCCESS — now serving from $STAGE_WT on :$LIVE_PORT"
   exit 0

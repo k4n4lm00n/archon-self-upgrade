@@ -32,17 +32,27 @@ git branch -f "$STAGE_BRANCH" "$TARGET_SHA" 2>/dev/null || git branch "$STAGE_BR
 git worktree add "$STAGE_WT" "$STAGE_BRANCH" || die "worktree add failed"
 
 if [ "$CARRY_LIVE_COMMITS" = 1 ]; then
-  # Replay commits on mylive but not in the target (patch-id aware; duplicates dropped).
-  REPLAY="$(git rev-list --reverse --cherry-pick --right-only "$TARGET_REF...$LIVE_SHA")"
+  # Re-add OUR unmerged changes on top of the new target. Prefer the blessed known-good sha
+  # (a well-defined, validated stack) over whatever mylive currently points at, so the carry
+  # set is stable even if the live worktree has drifted. Patch-id aware (--cherry-pick): any
+  # commit already merged into the target upstream is dropped, so nothing double-applies.
+  CARRY_SRC="$LIVE_SHA"; CARRY_FROM="mylive (${LIVE_SHA:0:12})"
+  KG_SHA="$(json_file_get "$MANIFEST" sha 2>/dev/null || true)"
+  if [ -n "${KG_SHA:-}" ] && git rev-parse --verify --quiet "${KG_SHA}^{commit}" >/dev/null 2>&1; then
+    CARRY_SRC="$KG_SHA"; CARRY_FROM="known-good (${KG_SHA:0:12})"
+  fi
+  log "carrying our unmerged commits from $CARRY_FROM onto $TARGET_REF (patch-id aware)"
+  REPLAY="$(git rev-list --reverse --cherry-pick --right-only "$TARGET_REF...$CARRY_SRC")"
   if [ -z "$REPLAY" ]; then
-    log "nothing to carry — target already contains mylive's commits"
+    log "nothing to carry — target already contains our commits"
   else
+    log "will replay $(printf '%s\n' "$REPLAY" | grep -c .) commit(s)"
     cd "$STAGE_WT" || die "cannot cd staging"
     for c in $REPLAY; do
-      log "cherry-pick ${c:0:12} ..."
+      log "cherry-pick ${c:0:12} $(git log -1 --format=%s "$c" 2>/dev/null | head -c 64)"
       if ! git cherry-pick --allow-empty "$c"; then
         git cherry-pick --abort 2>/dev/null
-        die "CONFLICT carrying ${c:0:12} — staging left clean; resolve or set CARRY_LIVE_COMMITS=0"
+        die "CONFLICT carrying ${c:0:12} onto $TARGET_REF — staging left clean. Resolve by hand (stage from $CARRY_FROM and cherry-pick the rest) or set CARRY_LIVE_COMMITS=0 to deploy the bare target."
       fi
     done
   fi

@@ -63,10 +63,19 @@ CONFIRM_TIMEOUT_S="${CONFIRM_TIMEOUT_S:-600}"   # confirmation window (default 1
 
 # ---- Cutover knobs ----
 CUTOVER_SETTLE="${CUTOVER_SETTLE:-45}"
-CARRY_LIVE_COMMITS="${CARRY_LIVE_COMMITS:-0}"
+# Default ON: an upgrade onto a newer target must ALWAYS re-add our unmerged changes, or a
+# self-upgrade would silently drop every local feature. 02-stage carries them patch-id aware
+# (anything already merged upstream is dropped), seeded from the known-good manifest below.
+CARRY_LIVE_COMMITS="${CARRY_LIVE_COMMITS:-1}"
 ENV_FILE="${ENV_FILE:-$HOME/.archon/.env}"   # sourced by cutover for adapter creds
 NOTIFY_CMD="${NOTIFY_CMD:-}"                  # optional: `$NOTIFY_CMD "<message>"` on outcome
 SCRUB_ENV_VARS="${SCRUB_ENV_VARS:-}"         # extra env var NAMES to strip for the smoke boot
+
+# ---- Known-good manifest (shared with start-current ensure_stack + rollback watchdog) ----
+# The blessed feature stack: 02-stage seeds the carry set from its sha; the cutover refreshes
+# it (+ a git bundle) on health-gate SUCCESS so the rollback floor tracks each good upgrade.
+MANIFEST="${MANIFEST:-$HOME/.archon/.local/known-good.json}"
+KG_BUNDLE_DIR="${KG_BUNDLE_DIR:-$UPGRADE_DIR/backups}"
 
 # Scrub CLAUDE_* so a child server is not detected as a nested Claude agent.
 CLAUDE_SCRUB=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
@@ -81,7 +90,7 @@ for _v in UPGRADE_DIR ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOT
   STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD BUILD_CMD TEST_CMD \
   BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS \
   REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
-  CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE NOTIFY_CMD OLD_PLATFORMS; do
+  CUTOVER_SETTLE CARRY_LIVE_COMMITS MANIFEST KG_BUNDLE_DIR ENV_FILE NOTIFY_CMD OLD_PLATFORMS; do
   SELFUPGRADE_SCRUB+=(-u "$_v")
 done; unset _v
 
@@ -181,7 +190,46 @@ detect_live() {
 }
 
 state_get(){ grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$STATE_FILE" | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'; }
+# Read one string field from any hand-rolled flat-JSON file ($1=file, $2=key).
+json_file_get(){ [ -f "$1" ] || return 1; grep -oE "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'; }
 port_busy(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+
+# Promote a worktree to the blessed known-good: rewrite the manifest + refresh its git bundle,
+# so the cold-start ensure_stack and the rollback watchdog both restore to THIS build. Called
+# from the cutover on health-gate SUCCESS (a validated-good build) — never on rollback, so the
+# rollback floor can only ever advance onto a build that passed the full gate. Best-effort:
+# any failure here is logged, never fatal (the cutover has already succeeded by this point).
+write_known_good(){ # $1 = worktree
+  local wt="$1" br sha plat bnd tmp
+  [ -n "$wt" ] && [ -d "$wt" ] || { log "known-good: no worktree '$wt' — skip promote"; return 0; }
+  br="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  sha="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  [ -n "$sha" ] || { log "known-good: cannot resolve HEAD of $wt — skip promote"; return 0; }
+  plat="$(capture_platforms "$LIVE_PORT")"
+  mkdir -p "$KG_BUNDLE_DIR"
+  bnd="$KG_BUNDLE_DIR/known-good-${sha:0:8}.bundle"
+  if git -C "$wt" bundle create "$bnd.tmp" "$br" >/dev/null 2>&1 && git -C "$wt" bundle verify "$bnd.tmp" >/dev/null 2>&1; then
+    mv -f "$bnd.tmp" "$bnd"
+  else
+    rm -f "$bnd.tmp"; log "known-good: WARN bundle create/verify failed for $wt @ ${sha:0:10}"; bnd=""
+  fi
+  tmp="$(mktemp)"
+  cat > "$tmp" <<JSON
+{
+  "_comment": "Blessed known-good live Archon composition. Written by the self-upgrade cutover on health-gate success and by rollback-watch/bless-known-good.sh. Consumed by start-current-archon.sh (ensure_stack) and rollback-watch/watchd.sh.",
+  "captured_utc": "$(date -u +%FT%TZ)",
+  "worktree": "$wt",
+  "branch": "$br",
+  "sha": "$sha",
+  "port": $LIVE_PORT,
+  "require_platforms": "$plat",
+  "dev_cmd": "$DEV_CMD",
+  "bundle": "$bnd"
+}
+JSON
+  mv -f "$tmp" "$MANIFEST" && log "known-good: promoted $wt -> ${br} @ ${sha:0:12} (manifest $MANIFEST, bundle ${bnd:-none})" \
+    || log "known-good: WARN could not write manifest $MANIFEST"
+}
 
 # --- health-gate helpers (shared by cutover) ---
 # Extract activePlatforms (one name per line) from a health JSON blob on stdin.
