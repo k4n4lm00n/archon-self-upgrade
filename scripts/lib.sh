@@ -12,6 +12,26 @@ STATE_FILE="$UPGRADE_DIR/state.json"
 LOG_DIR="$UPGRADE_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# Persistent per-host preferences. Anchored to the TOOLKIT dir (where this lib.sh lives), NOT
+# UPGRADE_DIR — the workflow repoints UPGRADE_DIR at $ARTIFACTS_DIR (ephemeral per run), but a saved
+# preference must survive across runs and redeploys. Managed by self-upgrade-config.sh, which writes
+# soft `VAR="${VAR:-value}"` lines: sourced BEFORE the defaults below, they set a knob only when the
+# environment has not already set it — so an explicit env var for a given run still wins. Kept out of
+# the committed, generic workflow YAML on purpose (host preference, not shipped config).
+TOOLKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_CONFIG="${SELFUPGRADE_CONFIG:-$TOOLKIT_DIR/config.env}"
+[ -f "$LOCAL_CONFIG" ] && source "$LOCAL_CONFIG"
+
+# Config resolved + persisted by 00-preflight (prompt-derived TARGET_REF, host tunables), so a
+# multi-process run inherits ONE resolution: the Archon workflow executes each phase in a fresh
+# shell, and this is how the target chosen in preflight reaches stage/validate/smoke/cutover. It
+# is the authoritative per-run snapshot (hard values), so it is sourced AFTER the local prefs: a
+# later phase must honor exactly what preflight resolved (which already folded in prefs + env).
+# Standalone single-shell use that passes env to each script never needs it; when the file is
+# absent this is a no-op. Written by persist_config() with %q so every value round-trips via source.
+RESOLVED_ENV="$UPGRADE_DIR/resolved.env"
+[ -f "$RESOLVED_ENV" ] && source "$RESOLVED_ENV"
+
 # ---- Remotes / target (prerequisites) ----
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/coleam00/Archon}"
@@ -63,10 +83,12 @@ CONFIRM_TIMEOUT_S="${CONFIRM_TIMEOUT_S:-600}"   # confirmation window (default 1
 
 # ---- Cutover knobs ----
 CUTOVER_SETTLE="${CUTOVER_SETTLE:-45}"
-# Default ON: an upgrade onto a newer target must ALWAYS re-add our unmerged changes, or a
-# self-upgrade would silently drop every local feature. 02-stage carries them patch-id aware
-# (anything already merged upstream is dropped), seeded from the known-good manifest below.
-CARRY_LIVE_COMMITS="${CARRY_LIVE_COMMITS:-1}"
+# Default OFF: most deployments track a fork/upstream ref with no unmerged local work, so the
+# plain target is what they want. Operators who DO run local commits on top of the target (like
+# this project) turn it on persistently with `self-upgrade-config.sh set carry-live-commits yes`
+# (or CARRY_LIVE_COMMITS=1 for one run). When on, 02-stage replays them patch-id aware (anything
+# already merged upstream is dropped), seeded from the known-good manifest below.
+CARRY_LIVE_COMMITS="${CARRY_LIVE_COMMITS:-0}"
 ENV_FILE="${ENV_FILE:-$HOME/.archon/.env}"   # sourced by cutover for adapter creds
 NOTIFY_CMD="${NOTIFY_CMD:-}"                  # optional: `$NOTIFY_CMD "<message>"` on outcome
 SCRUB_ENV_VARS="${SCRUB_ENV_VARS:-}"         # extra env var NAMES to strip for the smoke boot
@@ -97,6 +119,82 @@ done; unset _v
 ts(){ date -u +%H:%M:%S; }
 log(){ echo "[$(ts)] $*"; }
 die(){ echo "[$(ts)] FATAL: $*" >&2; exit 1; }
+
+# Resolve TARGET_REF from the trigger prompt ($1) when it was not given explicitly, then verify
+# it points at a real object. Precedence (the documented prompt UX — see README "How to run"):
+#   explicit TARGET_REF env  >  the target named after "to" in the prompt  >  the fork's default
+#   branch (no "to ..." at all). The target text after "to" is matched, in this order:
+#     <owner>/<repo>@<branch> or <url>@<branch> (someone else's fork) · upstream/<b>, <fork>/<b>,
+#     origin/<b> (explicit remote/branch) · "latest/newest/stable release" (highest semver tag) ·
+#     a version tag v0.6.0 · feat|fix|chore|hotfix|release/<...> or dev|main|master (branch — fork
+#     first, then upstream) · a raw commit SHA.
+# A target that is NAMED but cannot be resolved is a HARD ERROR — never a silent fallback. Call
+# from 00-preflight AFTER the remotes are fetched (tags included) so every ref is lookup-able.
+resolve_target_ref(){
+  local trigger="${1:-}" M T LOW TP RB VT BR SH SRC B URL FD t r
+  if [ -z "$TARGET_REF" ]; then
+    M="$trigger"
+    if printf '%s' " $M " | grep -qiE '[[:space:]]to[[:space:]]'; then
+      T="$(printf '%s' "$M" | sed -E 's/.*[[:space:]][Tt][Oo][[:space:]]+//')"
+    else T=""; fi
+    if [ -z "$T" ]; then
+      FD="$(git remote show "$FORK_REMOTE" 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -1)"
+      TARGET_REF="$FORK_REMOTE/${FD:-main}"
+    else
+      LOW="$(printf '%s' "$T" | tr 'A-Z' 'a-z')"
+      TP="$(printf '%s' "$T" | grep -oE '(https?://[^ ]+|[A-Za-z0-9_.:@/-]+\.git|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@[A-Za-z0-9._/-]+' | head -1 || true)"
+      RB="$(printf '%s' "$T" | grep -oE '(upstream|'"$FORK_REMOTE"'|origin)/[A-Za-z0-9._/-]+' | head -1 || true)"
+      VT="$(printf '%s' "$T" | grep -oE 'v?[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+      BR="$(printf '%s' "$T" | grep -oE '(feat|fix|chore|hotfix|release)/[A-Za-z0-9._/-]+' | head -1 || true)"
+      [ -z "$BR" ] && BR="$(printf '%s' "$T" | grep -owE 'dev|main|master' | head -1 || true)"
+      SH="$(printf '%s' "$T" | grep -oiE '[0-9a-f]{7,40}' | head -1 || true)"
+      if [ -n "$TP" ]; then
+        SRC="${TP%@*}"; B="${TP##*@}"
+        case "$SRC" in http*|git@*|*.git) URL="$SRC";; *) URL="https://github.com/$SRC";; esac
+        log "fetching third-party branch '$B' from $URL ..."
+        git fetch "$URL" "$B" --quiet || die "could not fetch '$B' from $URL"
+        TARGET_REF="$(git rev-parse FETCH_HEAD)"
+      elif [ -n "$RB" ]; then
+        git rev-parse --verify --quiet "$RB" >/dev/null && TARGET_REF="$RB" || die "remote branch '$RB' not found (is it pushed/fetched?)"
+      elif printf '%s' "$LOW" | grep -qE 'latest|newest|stable'; then
+        TARGET_REF="$(git tag --list 'v[0-9]*' | sort -V | tail -1)"; [ -n "$TARGET_REF" ] || die "no version tags found for 'latest release'"
+      elif [ -n "$VT" ]; then
+        for t in "$VT" "v$VT"; do git rev-parse --verify --quiet "refs/tags/$t" >/dev/null && { TARGET_REF="$t"; break; }; done
+        [ -n "$TARGET_REF" ] || die "version tag '$VT' not found among fetched tags"
+      elif [ -n "$BR" ]; then
+        for r in "$FORK_REMOTE/$BR" "$UPSTREAM_REMOTE/$BR"; do git rev-parse --verify --quiet "$r" >/dev/null && { TARGET_REF="$r"; break; }; done
+        [ -n "$TARGET_REF" ] || die "branch '$BR' not found on $FORK_REMOTE or $UPSTREAM_REMOTE"
+      elif [ -n "$SH" ]; then
+        git rev-parse --verify --quiet "${SH}^{commit}" >/dev/null && TARGET_REF="$SH" || die "commit '$SH' not found (is it fetched?)"
+      else
+        die "could not understand the upgrade target \"$T\" — see the README 'How to run'"
+      fi
+    fi
+  fi
+  git rev-parse --verify --quiet "$TARGET_REF" >/dev/null || die "TARGET_REF '$TARGET_REF' not resolvable"
+  log "target ref to deploy: $TARGET_REF ($(git rev-parse --short "$TARGET_REF"))"
+}
+
+# Persist the fully-resolved runtime config to RESOLVED_ENV so every later phase (each a fresh
+# shell in the workflow) re-sources the SAME resolution — most importantly the prompt-derived
+# TARGET_REF and the CARRY decision. Values are written with %q so they round-trip through
+# `source` safely. The location vars (UPGRADE_DIR / ARCHON_UPGRADE_DIR) are deliberately NOT
+# persisted — they bootstrap RESOLVED_ENV itself and must stay controlled by the caller.
+persist_config(){
+  local v
+  mkdir -p "$(dirname "$RESOLVED_ENV")"
+  {
+    for v in UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE TARGET_REF LIVE_PORT SMOKE_PORT \
+             STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD \
+             INSTALL_CMD TYPECHECK_CMD BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER \
+             CUTOVER_DEADLINE HEALTH_URL SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG \
+             FORBID_LOG HEALTH_CMD HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
+             CUTOVER_SETTLE CARRY_LIVE_COMMITS MANIFEST KG_BUNDLE_DIR ENV_FILE NOTIFY_CMD; do
+      printf '%s=%q\n' "$v" "${!v}"
+    done
+  } > "$RESOLVED_ENV"
+  log "persisted resolved config -> $RESOLVED_ENV"
+}
 
 # Messenger-agnostic smoke isolation. The server loads its user-scope env from
 # `getArchonEnvPath()`, which honors ARCHON_HOME, with override:true. So for the smoke boot we

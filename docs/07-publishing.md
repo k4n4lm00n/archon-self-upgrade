@@ -48,8 +48,12 @@ that adds one `MarketplaceEntry`.
 ```
 
 Notes:
-- `sourceUrl` is a **blob** URL to the single YAML because the workflow is self-contained
-  (it inlines all logic). No `scripts/` are needed at run time.
+- The workflow is **no longer self-contained** — its nodes `exec` the phase scripts in
+  `scripts/`, which are the single source of truth. Publishing must therefore ship the scripts,
+  not just the YAML: either (a) have the marketplace entry / an install step place `scripts/*.sh`
+  at `SELFUPGRADE_SCRIPTS` (default `$HOME/.archon/.local/upgrade`), or (b) point `sourceUrl` at a
+  packaged bundle rather than a single-file blob. A bare blob URL to `archon-self-upgrade.yaml`
+  alone will fail at run time with "self-upgrade scripts dir not found".
 - Keep `sourceUrl`'s `<COMMIT_SHA>` and the `sha` field identical.
 - `requires: [github]` in the workflow means users must have a connected GitHub identity —
   surfaced by the marketplace as a prerequisite.

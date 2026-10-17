@@ -30,14 +30,23 @@ description: |
   parity) — so breaking any integration (a messenger adapter, a forge, anything) rolls back.
   Operators add their own rollback constraints via env knobs (REQUIRE_LOG / FORBID_LOG,
   CUTOVER_DEADLINE, HEALTH_CMD / HEALTH_HOOK, and a human CONFIRM_CMD with a timeout). See
-  the `preflight` node and docs/06 for the full list.
+  docs/06 and scripts/lib.sh for the full list.
 
   This workflow reads no secrets from the YAML. All host specifics are env vars with
-  defaults (see the `preflight` node). Because the final cutover replaces the very process
-  this workflow runs inside, that step is launched DETACHED: the workflow returns once the
-  cutover is running, and the new (or rolled-back) server reports the final outcome via
-  NOTIFY_CMD (point it at the originating messenger to be told the result there) and
+  defaults (see scripts/lib.sh). Because the final cutover replaces the very process this
+  workflow runs inside, that step is launched DETACHED: the workflow returns once the cutover
+  is running, and the new (or rolled-back) server reports the final outcome via NOTIFY_CMD
+  (point it at the originating messenger to be told the result there) and
   $ARTIFACTS_DIR/cutover-status.json.
+
+  SINGLE SOURCE OF TRUTH: every phase below is a THIN wrapper that `exec`s the matching
+  phase script in the scripts/ toolkit (00-preflight … 05-cutover + lib.sh). All logic —
+  target resolution, isolation, the health gate, rollback, known-good promotion — lives in
+  those scripts; this YAML only orchestrates them and exposes them as an Archon workflow
+  (chat trigger, per-step status, artifacts, resumability). The nodes find the toolkit via
+  SELFUPGRADE_SCRIPTS (default: $HOME/.archon/.local/upgrade) and point ARCHON_UPGRADE_DIR
+  at $ARTIFACTS_DIR so state.json / resolved.env / logs land in the run's artifacts. Install
+  the toolkit there (copy scripts/*.sh) before running as a workflow.
 
 provider: claude
 tags:
@@ -52,175 +61,24 @@ mutates_checkout: true
 
 nodes:
   # ═══════════════════════════════════════════════════════════════════════════
-  # PHASE 0 — PREFLIGHT: prerequisites (upstream + myfork) and shared config.
-  # Writes $ARTIFACTS_DIR/upgrade.env, sourced by every later node.
+  # PHASE 0 — PREFLIGHT: ensure upstream/myfork remotes (fork upstream if myfork
+  # missing), resolve the deploy target from the prompt, persist the resolved
+  # config to $ARTIFACTS_DIR/resolved.env for every later phase. -> 00-preflight.sh
   # ═══════════════════════════════════════════════════════════════════════════
   - id: preflight
-    description: Ensure upstream/myfork remotes (fork upstream if myfork missing); write shared config.
+    description: Ensure upstream/myfork remotes (fork upstream if myfork missing); resolve target; persist config.
     timeout: 180000
     bash: |
       set -uo pipefail
-      ART="$ARTIFACTS_DIR"; mkdir -p "$ART"
-      die(){ echo "FATAL: $*" >&2; exit 1; }
-
-      git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository (cwd=$(pwd))"
-
-      # ---- Tunables (override via project/workflow env; safe defaults below) ----
-      UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
-      UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/coleam00/Archon}"
-      FORK_REMOTE="${FORK_REMOTE:-myfork}"
-      # TARGET_REF: what to deploy. Precedence: explicit env > trigger message > fork default branch.
-      TARGET_REF="${TARGET_REF:-}"
-      TRIGGER_MSG="$ARGUMENTS"
-
-      LIVE_PORT="${LIVE_PORT:-3090}"
-      SMOKE_PORT="${SMOKE_PORT:-3091}"
-      STAGE_WT="${STAGE_WT:-$HOME/worktrees/archon-upgrade-next}"
-      STAGE_BRANCH="${STAGE_BRANCH:-archon-upgrade-next}"
-
-      LIVE_PROC_PATTERN="${LIVE_PROC_PATTERN:-bun --watch src/index.ts}"
-      DEV_CMD="${DEV_CMD:-bun run dev}"
-      LIVE_PROC_COMM="${LIVE_PROC_COMM:-${DEV_CMD%% *}}"  # /proc/<pid>/comm of the real server
-      # Server-ONLY start for the isolated smoke boot. On the v0.8 monorepo `bun run dev` =
-      # `bun --filter '*' dev` fans out to server+web+docs (a second orchestrator/agent), which
-      # must not happen during an isolation test. Empty => the smoke node auto-picks the staged
-      # package's `dev:server` script when present, else DEV_CMD (older single-package layouts).
-      SMOKE_DEV_CMD="${SMOKE_DEV_CMD:-}"
-      INSTALL_CMD="${INSTALL_CMD:-bun install}"
-      TYPECHECK_CMD="${TYPECHECK_CMD:-bun run type-check}"
-      BUILD_CMD="${BUILD_CMD:-bun run build}"
-      TEST_CMD="${TEST_CMD:-}"                       # empty = skip; e.g. 'bun test'
-      BIN_PATH_PREPEND="${BIN_PATH_PREPEND:-$HOME/.bun/bin}"
-
-      # ---- HEALTH GATE: rollback constraints applied to the new build after cutover ----
-      # Default gate (generic, platform-agnostic): (1) READY_MARKER appears in the new log
-      # within CUTOVER_DEADLINE, and (2) the health endpoint reports status:ok AND every
-      # platform that was active on the OLD server is active again (platform parity) — so
-      # breaking ANY integration rolls back. Operators layer their OWN constraints below.
-      READY_MARKER="${READY_MARKER:-server_ready}"       # log line meaning startup finished
-      CUTOVER_DEADLINE="${CUTOVER_DEADLINE:-150}"        # max seconds to become healthy ("rollback if startup > N")
-      HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:$LIVE_PORT/api/health}"
-      SKIP_PLATFORM_PARITY="${SKIP_PLATFORM_PARITY:-0}"  # 1 = don't require the old platforms to return
-      REQUIRE_PLATFORMS="${REQUIRE_PLATFORMS:-}"         # ';'-list overriding auto-captured OLD_PLATFORMS
-      REQUIRE_LOG="${REQUIRE_LOG:-}"        # ';'-list of regexes that MUST appear in the new log
-      FORBID_LOG="${FORBID_LOG:-}"          # ';'-list of regexes that, if ANY appears, roll back
-      HEALTH_CMD="${HEALTH_CMD:-}"          # arbitrary command; must exit 0 (env: NEW_LOG, SERVER_URL, LIVE_PORT)
-      HEALTH_HOOK="${HEALTH_HOOK:-}"        # path to an executable operator hook; must exit 0 (same env)
-      CONFIRM_CMD="${CONFIRM_CMD:-}"        # blocks until a human confirms; non-zero/timeout => rollback
-      CONFIRM_TIMEOUT_S="${CONFIRM_TIMEOUT_S:-600}"      # confirmation window (default 10 min)
-
-      # Extra env var NAMES to strip for the isolated smoke boot, on top of the automatic
-      # credential-pattern scrub (see the smoke node). Use for anything the pattern misses.
-      SCRUB_ENV_VARS="${SCRUB_ENV_VARS:-}"
-
-      CUTOVER_SETTLE="${CUTOVER_SETTLE:-45}"
-      CARRY_LIVE_COMMITS="${CARRY_LIVE_COMMITS:-0}"  # 1 = replay mylive's unmerged commits onto target
-      ENV_FILE="${ENV_FILE:-$HOME/.archon/.env}"     # sourced by cutover for adapter creds
-      NOTIFY_CMD="${NOTIFY_CMD:-}"                    # optional: `$NOTIFY_CMD "<message>"` on outcome
-
-      # ---- Prerequisite: upstream remote ----
-      if git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
-        echo "upstream remote '$UPSTREAM_REMOTE' present: $(git remote get-url "$UPSTREAM_REMOTE")"
-      else
-        [ -n "$UPSTREAM_URL" ] || die "no '$UPSTREAM_REMOTE' remote and UPSTREAM_URL unset"
-        echo "adding upstream remote '$UPSTREAM_REMOTE' -> $UPSTREAM_URL"
-        git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL" || die "failed to add upstream remote"
-      fi
-      UP_SLUG="$(git remote get-url "$UPSTREAM_REMOTE" | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')"
-
-      # ---- Prerequisite: myfork remote (create by forking upstream if missing) ----
-      if git remote get-url "$FORK_REMOTE" >/dev/null 2>&1; then
-        echo "fork remote '$FORK_REMOTE' present: $(git remote get-url "$FORK_REMOTE")"
-      else
-        command -v gh >/dev/null 2>&1 || die "'$FORK_REMOTE' remote missing and gh CLI not found to create it"
-        gh auth status >/dev/null 2>&1 || die "'$FORK_REMOTE' missing and gh not authenticated (connect GitHub)"
-        echo "fork remote '$FORK_REMOTE' missing — forking $UP_SLUG ..."
-        # Creates the fork under the authenticated account if absent, and adds it as a remote.
-        gh repo fork "$UP_SLUG" --remote --remote-name "$FORK_REMOTE" --clone=false \
-          || die "gh repo fork failed"
-        git remote get-url "$FORK_REMOTE" >/dev/null 2>&1 || die "fork created but remote '$FORK_REMOTE' not set"
-      fi
-
-      git fetch "$FORK_REMOTE" --quiet || die "fetch $FORK_REMOTE failed"
-      git fetch "$UPSTREAM_REMOTE" --tags --quiet || echo "WARN: fetch $UPSTREAM_REMOTE failed (continuing)"
-
-      # ---- Resolve TARGET_REF ----
-      # Precedence: explicit TARGET_REF env  >  the target named after "to" in the prompt  >  the
-      # fork's default branch. The target (the text after "to ...") is matched, in this order:
-      #   <owner>/<repo>@<branch> or <url>@<branch> (someone else's fork) · upstream/<b>,
-      #   <fork>/<b>, origin/<b> (explicit remote/branch) · "latest/newest/stable release"
-      #   (highest semver tag) · a version tag v0.6.0 · feat|fix|chore|hotfix|release/<...> or
-      #   dev|main|master (branch — fork, then upstream) · a raw commit SHA.
-      # A target that is named but cannot be resolved is a HARD ERROR (never a silent fallback);
-      # only a prompt with no "to <target>" falls back to the fork's default branch.
-      if [ -z "$TARGET_REF" ]; then
-        M="$TRIGGER_MSG"
-        if printf '%s' " $M " | grep -qiE '[[:space:]]to[[:space:]]'; then
-          T="$(printf '%s' "$M" | sed -E 's/.*[[:space:]][Tt][Oo][[:space:]]+//')"
-        else T=""; fi
-        if [ -z "$T" ]; then
-          FD="$(git remote show "$FORK_REMOTE" 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -1)"
-          TARGET_REF="$FORK_REMOTE/${FD:-main}"
-        else
-          LOW="$(printf '%s' "$T" | tr 'A-Z' 'a-z')"
-          TP="$(printf '%s' "$T" | grep -oE '(https?://[^ ]+|[A-Za-z0-9_.:@/-]+\.git|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@[A-Za-z0-9._/-]+' | head -1 || true)"
-          RB="$(printf '%s' "$T" | grep -oE '(upstream|'"$FORK_REMOTE"'|origin)/[A-Za-z0-9._/-]+' | head -1 || true)"
-          VT="$(printf '%s' "$T" | grep -oE 'v?[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
-          BR="$(printf '%s' "$T" | grep -oE '(feat|fix|chore|hotfix|release)/[A-Za-z0-9._/-]+' | head -1 || true)"
-          [ -z "$BR" ] && BR="$(printf '%s' "$T" | grep -owE 'dev|main|master' | head -1 || true)"
-          SH="$(printf '%s' "$T" | grep -oiE '[0-9a-f]{7,40}' | head -1 || true)"
-          if [ -n "$TP" ]; then
-            SRC="${TP%@*}"; B="${TP##*@}"
-            case "$SRC" in http*|git@*|*.git) URL="$SRC";; *) URL="https://github.com/$SRC";; esac
-            echo "fetching third-party branch '$B' from $URL ..."
-            git fetch "$URL" "$B" --quiet || die "could not fetch '$B' from $URL"
-            TARGET_REF="$(git rev-parse FETCH_HEAD)"
-          elif [ -n "$RB" ]; then
-            git rev-parse --verify --quiet "$RB" >/dev/null && TARGET_REF="$RB" || die "remote branch '$RB' not found (is it pushed/fetched?)"
-          elif printf '%s' "$LOW" | grep -qE 'latest|newest|stable'; then
-            TARGET_REF="$(git tag --list 'v[0-9]*' | sort -V | tail -1)"; [ -n "$TARGET_REF" ] || die "no version tags found for 'latest release'"
-          elif [ -n "$VT" ]; then
-            for t in "$VT" "v$VT"; do git rev-parse --verify --quiet "refs/tags/$t" >/dev/null && { TARGET_REF="$t"; break; }; done
-            [ -n "$TARGET_REF" ] || die "version tag '$VT' not found among fetched tags"
-          elif [ -n "$BR" ]; then
-            for r in "$FORK_REMOTE/$BR" "$UPSTREAM_REMOTE/$BR"; do git rev-parse --verify --quiet "$r" >/dev/null && { TARGET_REF="$r"; break; }; done
-            [ -n "$TARGET_REF" ] || die "branch '$BR' not found on $FORK_REMOTE or $UPSTREAM_REMOTE"
-          elif [ -n "$SH" ]; then
-            git rev-parse --verify --quiet "${SH}^{commit}" >/dev/null && TARGET_REF="$SH" || die "commit '$SH' not found (is it fetched?)"
-          else
-            die "could not understand the upgrade target \"$T\" — see the workflow's How-to-run"
-          fi
-        fi
-      fi
-      git rev-parse --verify --quiet "$TARGET_REF" >/dev/null || die "TARGET_REF '$TARGET_REF' not resolvable"
-      echo "target ref to deploy: $TARGET_REF ($(git rev-parse --short "$TARGET_REF"))"
-
-      # Carry the live branch's unmerged commits onto the target (patch-id replay)? Triggered by a
-      # phrase in the prompt ("... with live commits", "carrying our changes", "porting my commits")
-      # or by CARRY_LIVE_COMMITS=1 env. env wins if already set to 1.
-      if [ "$CARRY_LIVE_COMMITS" != 1 ] && printf '%s' "$TRIGGER_MSG" | grep -qiE \
-        'live[ -]?commits?|(carry|port|replay|keep)[a-z]* (my |our |local |the |these |them |it )?(commit|change|patch)|with (my|our|local) (commit|change|patch)'; then
-        CARRY_LIVE_COMMITS=1
-        echo "will carry mylive's unmerged commits onto the target (patch-id replay)"
-      fi
-
-      # ---- Persist config for later nodes ----
-      {
-        for v in UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE TARGET_REF LIVE_PORT SMOKE_PORT \
-                 STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD \
-                 BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
-                 SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD \
-                 HEALTH_HOOK CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS \
-                 CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE NOTIFY_CMD; do
-          printf '%s=%q\n' "$v" "${!v}"
-        done
-        printf 'REPO_ROOT=%q\n' "$(git rev-parse --show-toplevel)"
-      } > "$ART/upgrade.env"
-      echo "=== preflight OK; wrote $ART/upgrade.env ==="
-      cat "$ART/upgrade.env"
+      SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
+      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU"; echo "install the scripts/ toolkit there, or set SELFUPGRADE_SCRIPTS to its path."; exit 1; }
+      export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"   # state.json / resolved.env / logs land in this run's artifacts
+      export ARGUMENTS                             # trigger prompt -> resolve_target_ref ("self upgrade to <target>")
+      exec bash "$SU/00-preflight.sh"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # PHASE 1 — SNAPSHOT: capture the live instance as the rollback anchor.
+  # PHASE 1 — SNAPSHOT: capture the live instance (pgid + worktree + platforms)
+  # as the rollback anchor. -> 01-snapshot.sh
   # ═══════════════════════════════════════════════════════════════════════════
   - id: snapshot
     description: Detect the live server (pgid + worktree) and write the rollback anchor.
@@ -228,100 +86,29 @@ nodes:
     timeout: 60000
     bash: |
       set -uo pipefail
-      ART="$ARTIFACTS_DIR"; source "$ART/upgrade.env"
-      die(){ echo "FATAL: $*" >&2; exit 1; }
-
-      # A command line can MENTION the pattern without being the server (a shell running
-      # pgrep, an editor, this run's own launcher). Anchoring the rollback to one of those —
-      # or stopping its group at cutover — would hit the wrong process tree, so require the
-      # match to actually be the server binary. Identical to scripts/lib.sh:live_pid.
-      live_pid(){ local p; for p in $(pgrep -f "$LIVE_PROC_PATTERN" 2>/dev/null); do
-        [ "$p" = "$$" ] && continue
-        [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$LIVE_PROC_COMM" ] || continue
-        echo "$p"; return 0; done; return 1; }
-
-      WATCH_PID="$(live_pid)"
-      [ -n "$WATCH_PID" ] || die "no live '$LIVE_PROC_COMM' process matching '$LIVE_PROC_PATTERN' — is the server up?"
-      CWD="$(readlink "/proc/$WATCH_PID/cwd" 2>/dev/null)"
-      LIVE_PGID="$(ps -o pgid= -p "$WATCH_PID" | tr -d ' ')"
-      LIVE_WT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)"
-      [ -n "$LIVE_PGID" ] && [ -n "$LIVE_WT" ] || die "could not resolve live pgid/worktree"
-      cd "$LIVE_WT" || die "live worktree $LIVE_WT missing"
-
-      # Capture the platforms the OLD server currently has up, for the cutover's parity gate:
-      # the set the new build must restore (unless overridden by REQUIRE_PLATFORMS).
-      OLD_PLATFORMS="$(curl -s --max-time 5 "$HEALTH_URL" 2>/dev/null \
-        | grep -oE '"activePlatforms"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -oE '\[[^]]*\]' \
-        | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | paste -sd';' -)"
-      [ -n "$OLD_PLATFORMS" ] && echo "old active platforms: $OLD_PLATFORMS" \
-        || echo "WARN: could not read $HEALTH_URL — platform parity will require nothing"
-
-      cat > "$ART/state.json" <<JSON
-      {
-        "captured_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-        "live_worktree": "$LIVE_WT",
-        "live_branch": "$(git rev-parse --abbrev-ref HEAD)",
-        "live_sha": "$(git rev-parse HEAD)",
-        "live_pgid": "$LIVE_PGID",
-        "live_port": "$LIVE_PORT",
-        "old_platforms": "$OLD_PLATFORMS"
-      }
-      JSON
-      echo "=== snapshot (rollback anchor) ==="; cat "$ART/state.json"
+      SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
+      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU (set SELFUPGRADE_SCRIPTS)"; exit 1; }
+      export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"
+      exec bash "$SU/01-snapshot.sh"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # PHASE 2 — STAGE: build the target in an isolated worktree. Non-destructive.
+  # PHASE 2 — STAGE: build the target in an isolated worktree (optional patch-id
+  # carry of our unmerged commits). Non-destructive. -> 02-stage.sh
   # ═══════════════════════════════════════════════════════════════════════════
   - id: stage
-    description: Create the staging worktree at TARGET_REF (optionally replay mylive's local commits).
+    description: Create the staging worktree at TARGET_REF (optionally replay our unmerged commits).
     depends_on: [snapshot]
     timeout: 300000
     bash: |
       set -uo pipefail
-      ART="$ARTIFACTS_DIR"; source "$ART/upgrade.env"
-      die(){ echo "FATAL: $*" >&2; exit 1; }
-      LIVE_WT="$(sed -n 's/.*"live_worktree": "\([^"]*\)".*/\1/p' "$ART/state.json")"
-      LIVE_SHA="$(sed -n 's/.*"live_sha": "\([^"]*\)".*/\1/p' "$ART/state.json")"
-      cd "$LIVE_WT" || die "live worktree missing"
-
-      TARGET_SHA="$(git rev-parse "$TARGET_REF")"
-      echo "staging target $TARGET_REF -> ${TARGET_SHA:0:12}"
-
-      # (Re)create the staging worktree at the target.
-      if git worktree list --porcelain | grep -q "$STAGE_WT"; then
-        echo "removing stale staging worktree $STAGE_WT"
-        git worktree remove --force "$STAGE_WT" 2>/dev/null || rm -rf "$STAGE_WT"
-      fi
-      git branch -f "$STAGE_BRANCH" "$TARGET_SHA" 2>/dev/null || git branch "$STAGE_BRANCH" "$TARGET_SHA"
-      git worktree add "$STAGE_WT" "$STAGE_BRANCH" || die "worktree add failed"
-
-      if [ "$CARRY_LIVE_COMMITS" = 1 ]; then
-        # Replay commits that are on mylive but not in the target (patch-id aware).
-        REPLAY="$(git rev-list --reverse --cherry-pick --right-only "$TARGET_REF...$LIVE_SHA")"
-        if [ -z "$REPLAY" ]; then
-          echo "nothing to carry — target already contains mylive's commits"
-        else
-          cd "$STAGE_WT" || die "cannot cd staging"
-          for c in $REPLAY; do
-            echo "cherry-pick ${c:0:12} ..."
-            if ! git cherry-pick --allow-empty "$c"; then
-              git cherry-pick --abort 2>/dev/null
-              die "CONFLICT carrying ${c:0:12} — staging left clean; resolve or set CARRY_LIVE_COMMITS=0"
-            fi
-          done
-        fi
-      fi
-
-      cd "$STAGE_WT" || die "cannot cd staging"
-      echo "=== staging ready at $STAGE_WT ($(git rev-parse --short HEAD)) ==="
-      git log --oneline -6 | sed 's/^/    /'
-      echo "--- non-code files changed vs live (eyeball config/migration/workflow drift) ---"
-      git diff --name-only "$LIVE_SHA" HEAD -- \
-        '*.yaml' '*.yml' '*.sql' '*.md' '.env*' '*.json' '.claude/**' '.archon/**' 2>/dev/null \
-        | sed 's/^/    /' | head -60 || true
+      SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
+      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU (set SELFUPGRADE_SCRIPTS)"; exit 1; }
+      export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"
+      exec bash "$SU/02-stage.sh"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # PHASE 3 — VALIDATE: install / type-check / build / tests. Non-destructive.
+  # -> 03-validate.sh
   # ═══════════════════════════════════════════════════════════════════════════
   - id: validate
     description: Install, type-check, build, and (optionally) test the staged build.
@@ -329,31 +116,14 @@ nodes:
     timeout: 900000
     bash: |
       set -uo pipefail
-      ART="$ARTIFACTS_DIR"; source "$ART/upgrade.env"
-      die(){ echo "FATAL: $*" >&2; exit 1; }
-      cd "$STAGE_WT" || die "no staging worktree — did stage fail?"
-      export PATH="$BIN_PATH_PREPEND:$PATH"
-
-      LIVE_WT="$(sed -n 's/.*"live_worktree": "\([^"]*\)".*/\1/p' "$ART/state.json")"
-      # Schema-drift guard: staging migrations must match live or a boot may hit un-applied schema.
-      if [ -d migrations ] && [ -d "$LIVE_WT/migrations" ]; then
-        if ! diff <(cd "$LIVE_WT" && git ls-tree --name-only HEAD migrations/ | sort) \
-                  <(git ls-tree --name-only HEAD migrations/ | sort) >/dev/null; then
-          echo "WARN: migration set differs between live and staging — verify they apply at startup."
-        else
-          echo "migration set matches live (no schema drift)."
-        fi
-      fi
-
-      echo "== install =="; eval "$INSTALL_CMD" || die "install failed"
-      [ -n "$TYPECHECK_CMD" ] && { echo "== type-check =="; eval "$TYPECHECK_CMD" || die "type-check failed"; }
-      [ -n "$BUILD_CMD" ]     && { echo "== build =="; eval "$BUILD_CMD" || die "build failed"; }
-      [ -n "$TEST_CMD" ]      && { echo "== tests =="; eval "$TEST_CMD" || die "tests failed"; }
-      echo "=== VALIDATE OK — $STAGE_WT ($(git rev-parse --short HEAD)) ==="
+      SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
+      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU (set SELFUPGRADE_SCRIPTS)"; exit 1; }
+      export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"
+      exec bash "$SU/03-validate.sh"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # PHASE 4 — SMOKE: boot the staged build in isolation (all creds stripped).
-  # This is the automated "is staging fine?" gate. cutover depends on it passing.
+  # PHASE 4 — SMOKE: boot the staged build in isolation (all creds stripped),
+  # assert health + Web-only isolation, then kill. -> 04-smoke.sh
   # ═══════════════════════════════════════════════════════════════════════════
   - id: smoke
     description: Boot the staged build on SMOKE_PORT with external creds stripped; assert health, then kill.
@@ -361,105 +131,17 @@ nodes:
     timeout: 180000
     bash: |
       set -uo pipefail
-      ART="$ARTIFACTS_DIR"; source "$ART/upgrade.env"
-      die(){ echo "FATAL: $*" >&2; exit 1; }
-      SMOKE_LOG="$ART/smoke.log"; : > "$SMOKE_LOG"
-      cd "$STAGE_WT" || die "no staging worktree"
-
-      ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$SMOKE_PORT\$" && die "port $SMOKE_PORT already in use"
-
-      # Strip Claude-nesting so the child isn't detected as a nested agent.
-      CLAUDE_SCRUB=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
-        -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS -u CLAUDE_CODE_SESSION_ID)
-      # Also strip this run's config vars so the child never carries them (matches the cutover).
-      SELFUPGRADE_SCRUB=(); for _v in ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE \
-        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD \
-        BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
-        SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK \
-        CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE \
-        NOTIFY_CMD OLD_PLATFORMS; do SELFUPGRADE_SCRUB+=(-u "$_v"); done
-
-      # Messenger-agnostic isolation. The server loads its user-scope env from ARCHON_HOME/.env
-      # with override:true, so point ARCHON_HOME at a scratch dir holding a credential-blanked
-      # COPY of the env file. Every adapter's presence-gate (Boolean(env.X)) then goes false =>
-      # no adapter starts, while DB/other config still load. No HOME override (Claude global auth
-      # keeps working). Every v0.8 adapter gates on a credential-pattern var, so blanking them all
-      # disables each: Telegram/Discord/Slack (*_BOT_TOKEN/*_APP_TOKEN), GitHub App+PAT (shared
-      # WEBHOOK_SECRET -> selectGitHubAuthMode 'none'), Gitea/GitLab (*_TOKEN + *_WEBHOOK_SECRET),
-      # Zulip (ZULIP_BOT_EMAIL, ZULIP_BOT_API_KEY).
-      CRED_RE='(TOKEN|SECRET|API_?KEY|WEBHOOK|PASSWORD|PASSWD|CREDENTIAL|BOT_|_BOT)'
-      # Copy env file $1 -> $2, blanking the VALUE of every credential-like var (+ SCRUB_ENV_VARS).
-      scrub_env_file(){
-        local src="$1" dst="$2" line name extra=" $SCRUB_ENV_VARS "
-        [ -f "$src" ] || { : > "$dst"; return 0; }
-        while IFS= read -r line || [ -n "$line" ]; do
-          case "$line" in
-            ''|\#*) printf '%s\n' "$line" ;;
-            *=*) name="${line%%=*}"; name="${name#export }"; name="${name## }"
-              if printf '%s' "$name" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' \
-                 && { printf '%s' "$name" | grep -Eq "$CRED_RE" || [[ "$extra" == *" $name "* ]]; }; then
-                printf '%s=\n' "$name"; else printf '%s\n' "$line"; fi ;;
-            *) printf '%s\n' "$line" ;;
-          esac
-        done < "$src" > "$dst"
-      }
-      SMOKE_ARCHON_HOME="$ART/smoke-archon"; rm -rf "$SMOKE_ARCHON_HOME"; mkdir -p "$SMOKE_ARCHON_HOME"
-      scrub_env_file "$ENV_FILE" "$SMOKE_ARCHON_HOME/.env"
-      echo "smoke isolation: ARCHON_HOME=$SMOKE_ARCHON_HOME ($(grep -cE '=$' "$SMOKE_ARCHON_HOME/.env") creds blanked)"
-
-      # v0.8 three-path env model defense: loadArchonEnv() loads <cwd>/.archon/.env (repo scope)
-      # with override:true AFTER the scrubbed ARCHON_HOME/.env, so a credentialed repo-scope file
-      # in the staging worktree would re-enable adapters. Scrub it in place for the boot; restore
-      # it byte-for-byte in cleanup so the worktree ends unchanged (nothing leaks to cutover).
-      REPO_ENV="$STAGE_WT/.archon/.env"; REPO_ENV_BAK=""
-      if [ -f "$REPO_ENV" ]; then
-        REPO_ENV_BAK="$(mktemp)"; cp "$REPO_ENV" "$REPO_ENV_BAK"
-        scrub_env_file "$REPO_ENV_BAK" "$REPO_ENV"
-        echo "smoke isolation: scrubbed repo-scope $REPO_ENV for the boot (restored on exit)"
-      fi
-
-      # Server-ONLY start: on the v0.8 monorepo `bun run dev` = `bun --filter '*' dev` fans out to
-      # server+web+docs (a second orchestrator). Use SMOKE_DEV_CMD if set, else the staged package's
-      # own dev:server script when present, else DEV_CMD (older single-package layouts).
-      if [ -n "$SMOKE_DEV_CMD" ]; then SMOKE_CMD="$SMOKE_DEV_CMD"
-      elif [ -f "$STAGE_WT/package.json" ] && grep -Eq '"dev:server"[[:space:]]*:' "$STAGE_WT/package.json"; then SMOKE_CMD="bun run dev:server"
-      else SMOKE_CMD="$DEV_CMD"; fi
-
-      echo "booting staged build on :$SMOKE_PORT (server-only: '$SMOKE_CMD'; adapters disabled via scrubbed ARCHON_HOME) ..."
-      setsid env "${CLAUDE_SCRUB[@]}" "${SELFUPGRADE_SCRUB[@]}" ARCHON_HOME="$SMOKE_ARCHON_HOME" \
-        ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING=1 PATH="$BIN_PATH_PREPEND:$PATH" PORT="$SMOKE_PORT" \
-        $SMOKE_CMD </dev/null >"$SMOKE_LOG" 2>&1 &
-      SMOKE_PGID="$!"
-      restore_repo_env(){ [ -n "$REPO_ENV_BAK" ] && { cp "$REPO_ENV_BAK" "$REPO_ENV" 2>/dev/null || true; rm -f "$REPO_ENV_BAK"; REPO_ENV_BAK=""; }; }
-      cleanup(){ kill -TERM -"$SMOKE_PGID" 2>/dev/null; kill -KILL -"$SMOKE_PGID" 2>/dev/null; restore_repo_env; rm -rf "$SMOKE_ARCHON_HOME"; }
-      trap cleanup EXIT
-
-      ok=0
-      for i in $(seq 1 120); do
-        grep -q "$READY_MARKER" "$SMOKE_LOG" 2>/dev/null && { ok=1; echo "$READY_MARKER after ${i}s"; break; }
-        kill -0 "$SMOKE_PGID" 2>/dev/null || { echo "--- smoke.log tail ---"; tail -30 "$SMOKE_LOG"; die "smoke server died early"; }
-        sleep 1
-      done
-      [ "$ok" = 1 ] || { echo "--- smoke.log tail ---"; tail -30 "$SMOKE_LOG"; die "'$READY_MARKER' not seen in 120s"; }
-
-      code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SMOKE_PORT/" 2>/dev/null)"
-      echo "HTTP / -> $code"
-      case "$code" in 2*|3*|4*) echo "HTTP responding" ;; *) die "no HTTP response on :$SMOKE_PORT" ;; esac
-
-      # Isolation assertion: with every credential blanked the ONLY active platform must be Web.
-      # Any messenger/forge here means an adapter connected (queue theft / a rogue bot) — fail hard.
-      platforms="$(curl -s --max-time 5 "http://127.0.0.1:$SMOKE_PORT/api/health" 2>/dev/null \
-        | grep -oE '"activePlatforms"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -oE '\[[^]]*\]' \
-        | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | paste -sd';' -)"
-      echo "activePlatforms: [${platforms}]"
-      [ "$platforms" = "Web" ] || die "smoke NOT isolated — activePlatforms=[${platforms}] (expected [Web]); an adapter connected"
-      echo "=== SMOKE OK — staged build boots, serves, and is isolated (Web only); tearing down ==="
+      SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
+      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU (set SELFUPGRADE_SCRIPTS)"; exit 1; }
+      export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"
+      exec bash "$SU/04-smoke.sh"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # PHASE 5 — CUTOVER: destructive, self-healing. Launched DETACHED because it
-  # replaces the process group this workflow runs inside. The node returns as
-  # soon as the cutover is running; the new (or rolled-back) server reports the
-  # final outcome via NOTIFY_CMD and $ARTIFACTS_DIR/cutover-status.json.
+  # PHASE 5 — CUTOVER: destructive, self-healing. 05-cutover.sh IS the detached
+  # runner (it re-sources lib.sh + state.json and redirects its own output). It
+  # replaces the process group this workflow runs inside, so it is LAUNCHED
+  # DETACHED and this node returns immediately — never `exec`d. The new (or
+  # rolled-back) server reports the outcome via NOTIFY_CMD and cutover-status.json.
   # ═══════════════════════════════════════════════════════════════════════════
   - id: cutover
     description: Launch the detached, self-healing cutover (health gate keeps every active integration or rolls back).
@@ -467,130 +149,14 @@ nodes:
     timeout: 60000
     bash: |
       set -uo pipefail
-      ART="$ARTIFACTS_DIR"; source "$ART/upgrade.env"
-      die(){ echo "FATAL: $*" >&2; exit 1; }
-      RUNNER="$ART/run-cutover.sh"
-
-      # Write the self-contained cutover runner. It sources upgrade.env + state.json, so it
-      # is fully independent of this (soon-to-be-killed) process.
-      cat > "$RUNNER" <<'CUT'
-      #!/usr/bin/env bash
-      set -uo pipefail
-      ART="__ART__"; source "$ART/upgrade.env"
-      exec >>"$ART/cutover.log" 2>&1
-      ts(){ date -u +%FT%TZ; }
-      log(){ echo "[$(ts)] $*"; }
-      status(){ echo "{\"phase\":\"$1\",\"detail\":\"$2\",\"utc\":\"$(ts)\"}" > "$ART/cutover-status.json"; }
-      notify(){ [ -n "${NOTIFY_CMD:-}" ] && eval "$NOTIFY_CMD \"archon-self-upgrade: $1\"" || true; }
-
-      OLD_WT="$(sed -n 's/.*"live_worktree": "\([^"]*\)".*/\1/p' "$ART/state.json")"
-      OLD_PGID="$(sed -n 's/.*"live_pgid": "\([^"]*\)".*/\1/p' "$ART/state.json")"
-      OLD_PLATFORMS="$(sed -n 's/.*"old_platforms": "\([^"]*\)".*/\1/p' "$ART/state.json")"   # required set for parity
-      [ -f "$ENV_FILE" ] && { set -a; source "$ENV_FILE"; set +a; }   # adapter creds for the real boot
-
-      CLAUDE_SCRUB=(-u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
-        -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS -u CLAUDE_CODE_SESSION_ID)
-      # This run's config vars must NOT leak into the long-lived server (a later upgrade, a
-      # subprocess of it, would inherit e.g. a stale REQUIRE_LOG and misbehave). Strip them.
-      SELFUPGRADE_SCRUB=(); for _v in ARCHON_UPGRADE_DIR UPSTREAM_REMOTE UPSTREAM_URL FORK_REMOTE \
-        TARGET_REF STAGE_WT STAGE_BRANCH LIVE_PROC_PATTERN LIVE_PROC_COMM DEV_CMD SMOKE_DEV_CMD INSTALL_CMD TYPECHECK_CMD \
-        BUILD_CMD TEST_CMD BIN_PATH_PREPEND READY_MARKER CUTOVER_DEADLINE HEALTH_URL \
-        SKIP_PLATFORM_PARITY REQUIRE_PLATFORMS REQUIRE_LOG FORBID_LOG HEALTH_CMD HEALTH_HOOK \
-        CONFIRM_CMD CONFIRM_TIMEOUT_S SCRUB_ENV_VARS CUTOVER_SETTLE CARRY_LIVE_COMMITS ENV_FILE \
-        NOTIFY_CMD OLD_PLATFORMS; do SELFUPGRADE_SCRUB+=(-u "$_v"); done
-
-      log "==== cutover started (pid $$) : $OLD_WT -> $STAGE_WT ===="
-      log "health gate: parity=$([ "$SKIP_PLATFORM_PARITY" = 1 ] && echo off || echo "need[${REQUIRE_PLATFORMS:-$OLD_PLATFORMS}]") deadline=${CUTOVER_DEADLINE}s require_log=[$REQUIRE_LOG] forbid_log=[$FORBID_LOG] health_cmd=$([ -n "$HEALTH_CMD" ] && echo yes || echo no) confirm=$([ -n "$CONFIRM_CMD" ] && echo "yes(${CONFIRM_TIMEOUT_S}s)" || echo no)"
-      status starting "settling ${CUTOVER_SETTLE}s"; sleep "$CUTOVER_SETTLE"
-
-      # A command line can MENTION the pattern without being the server (a shell running
-      # pgrep, an editor, this run's own launcher). Anchoring the rollback to one of those —
-      # or stopping its group at cutover — would hit the wrong process tree, so require the
-      # match to actually be the server binary. Identical to scripts/lib.sh:live_pid.
-      live_pid(){ local p; for p in $(pgrep -f "$LIVE_PROC_PATTERN" 2>/dev/null); do
-        [ "$p" = "$$" ] && continue
-        [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$LIVE_PROC_COMM" ] || continue
-        echo "$p"; return 0; done; return 1; }
-      port_busy(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
-      stop_group(){ kill -TERM -"$1" 2>/dev/null; for i in $(seq 1 15); do kill -0 -"$1" 2>/dev/null || return 0; sleep 1; done; kill -KILL -"$1" 2>/dev/null; }
-      start_server(){ cd "$1" || return 1; setsid env "${CLAUDE_SCRUB[@]}" "${SELFUPGRADE_SCRUB[@]}" ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING=1 \
-        PATH="$BIN_PATH_PREPEND:$PATH" PORT="$LIVE_PORT" $DEV_CMD </dev/null >"$2" 2>&1 & echo "$!"; }
-
-      # ---- HEALTH GATE (identical to scripts/lib.sh:run_health_gate) ----
-      _platforms_from_health(){ grep -oE '"activePlatforms"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -oE '\[[^]]*\]' | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//'; }
-      _forbid_hit(){ [ -n "$FORBID_LOG" ] || return 1; local IFS=';' pat; for pat in $FORBID_LOG; do [ -n "$pat" ] && grep -Eq "$pat" "$1" 2>/dev/null && { log "  [gate] FORBID_LOG matched: /$pat/"; return 0; }; done; return 1; }
-      run_health_gate(){ # $1=logfile ; $2=mode(full|basic)
-        local logf="$1" mode="${2:-full}" start ready h have want p pat missing; start="$(date +%s)"
-        ready=0
-        while :; do
-          _forbid_hit "$logf" && return 1
-          grep -q "$READY_MARKER" "$logf" 2>/dev/null && ready=1; [ "$ready" = 1 ] && break
-          [ $(( $(date +%s) - start )) -ge "$CUTOVER_DEADLINE" ] && { log "  [gate] startup exceeded ${CUTOVER_DEADLINE}s (no '$READY_MARKER')"; return 1; }
-          sleep 1
-        done
-        log "  [gate] startup ok ('$READY_MARKER') after $(( $(date +%s) - start ))s"
-        if [ "$SKIP_PLATFORM_PARITY" != 1 ]; then
-          want="${REQUIRE_PLATFORMS:-$OLD_PLATFORMS}"
-          while :; do
-            h="$(curl -s --max-time 5 "$HEALTH_URL" 2>/dev/null)"
-            if printf '%s' "$h" | grep -qE '"status"[[:space:]]*:[[:space:]]*"ok"'; then
-              have="$(printf '%s' "$h" | _platforms_from_health)"; missing=""; local IFS=';'
-              for p in $want; do [ -n "$p" ] || continue; printf '%s\n' "$have" | grep -Fxq "$p" || missing="$missing $p"; done; unset IFS
-              [ -z "$missing" ] && { log "  [gate] health ok + platform parity (required: ${want:-<none>})"; break; }
-            fi
-            _forbid_hit "$logf" && return 1
-            [ $(( $(date +%s) - start )) -ge "$CUTOVER_DEADLINE" ] && { log "  [gate] health/parity not reached (missing:${missing:-?})"; return 1; }
-            sleep 2
-          done
-        fi
-        [ "$mode" = basic ] && { log "  [gate] basic checks passed"; return 0; }
-        if [ -n "$REQUIRE_LOG" ]; then local IFS=';'; for pat in $REQUIRE_LOG; do [ -n "$pat" ] || continue
-            while :; do grep -Eq "$pat" "$logf" 2>/dev/null && { log "  [gate] REQUIRE_LOG ok: /$pat/"; break; }
-              _forbid_hit "$logf" && { unset IFS; return 1; }
-              [ $(( $(date +%s) - start )) -ge "$CUTOVER_DEADLINE" ] && { log "  [gate] REQUIRE_LOG not found: /$pat/"; unset IFS; return 1; }
-              sleep 2; done; done; unset IFS; fi
-        if [ -n "$HEALTH_CMD" ]; then log "  [gate] running HEALTH_CMD ..."; NEW_LOG="$logf" SERVER_URL="$HEALTH_URL" LIVE_PORT="$LIVE_PORT" bash -c "$HEALTH_CMD" || { log "  [gate] HEALTH_CMD failed"; return 1; }; fi
-        if [ -n "$HEALTH_HOOK" ] && [ -x "$HEALTH_HOOK" ]; then log "  [gate] running HEALTH_HOOK ..."; NEW_LOG="$logf" SERVER_URL="$HEALTH_URL" LIVE_PORT="$LIVE_PORT" "$HEALTH_HOOK" || { log "  [gate] HEALTH_HOOK failed"; return 1; }; fi
-        if [ -n "$CONFIRM_CMD" ]; then log "  [gate] awaiting confirmation (timeout ${CONFIRM_TIMEOUT_S}s) ..."; NEW_LOG="$logf" SERVER_URL="$HEALTH_URL" LIVE_PORT="$LIVE_PORT" timeout "$CONFIRM_TIMEOUT_S" bash -c "$CONFIRM_CMD" || { log "  [gate] not confirmed within ${CONFIRM_TIMEOUT_S}s"; return 1; }; fi
-        log "  [gate] ALL CHECKS PASSED"; return 0
-      }
-
-      # Stop old (re-detect in case it restarted since snapshot; never orphan it).
-      STOP_LIST="$OLD_PGID"
-      NP="$(live_pid)"
-      if [ -n "$NP" ]; then NPGID="$(ps -o pgid= -p "$NP" | tr -d ' ')"; [ -n "$NPGID" ] && [ "$NPGID" != "$OLD_PGID" ] && STOP_LIST="$OLD_PGID $NPGID"; fi
-      status stopping "pgids: $STOP_LIST"
-      for pg in $STOP_LIST; do log "stopping group $pg"; stop_group "$pg"; done
-      for i in $(seq 1 30); do port_busy "$LIVE_PORT" || break; sleep 1; done
-
-      status starting_new "$STAGE_WT"; NEW_LOG="$ART/server-new.log"; : > "$NEW_LOG"
-      NEW_PGID="$(start_server "$STAGE_WT" "$NEW_LOG")"; log "new server pgid $NEW_PGID"
-      status checking "applying health gate to new build"
-      if run_health_gate "$NEW_LOG" full; then
-        status success "new build live from $STAGE_WT (pgid $NEW_PGID)"
-        log "==== CUTOVER SUCCESS ===="; notify "SUCCESS — now serving $TARGET_REF on :$LIVE_PORT"; exit 0
-      fi
-
-      log "==== new build FAILED the health gate — ROLLING BACK ===="
-      status rolling_back "restoring $OLD_WT"; stop_group "$NEW_PGID"
-      for i in $(seq 1 30); do port_busy "$LIVE_PORT" || break; sleep 1; done
-      OLD_LOG="$ART/server-rollback.log"; : > "$OLD_LOG"
-      RB_PGID="$(start_server "$OLD_WT" "$OLD_LOG")"; log "old server relaunched pgid $RB_PGID"
-      if run_health_gate "$OLD_LOG" basic; then
-        status rolled_back "link restored from $OLD_WT (pgid $RB_PGID); upgrade aborted"
-        log "==== ROLLBACK OK ===="; notify "ROLLED BACK — new build failed the health gate, original restored"; exit 2
-      fi
-      status FAILED "rollback unhealthy — MANUAL INTERVENTION NEEDED (see $OLD_LOG)"
-      log "==== FATAL: rollback unhealthy ===="; notify "FAILED — rollback unhealthy, MANUAL INTERVENTION NEEDED"; exit 3
-      CUT
-
-      sed -i "s#__ART__#$ART#g" "$RUNNER"
-      chmod +x "$RUNNER"
-      : > "$ART/cutover.log"
-      echo '{"phase":"launching","detail":"detached cutover starting","utc":"'"$(date -u +%FT%TZ)"'"}' > "$ART/cutover-status.json"
-      setsid bash "$RUNNER" </dev/null >>"$ART/cutover.log" 2>&1 &
+      SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
+      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU (set SELFUPGRADE_SCRIPTS)"; exit 1; }
+      export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"
+      mkdir -p "$ARTIFACTS_DIR/logs"
+      echo '{"phase":"launching","detail":"detached cutover starting","utc":"'"$(date -u +%FT%TZ)"'"}' > "$ARTIFACTS_DIR/cutover-status.json"
+      setsid bash "$SU/05-cutover.sh" </dev/null >>"$ARTIFACTS_DIR/logs/cutover.log" 2>&1 &
       echo "=== cutover launched DETACHED (pid $!) ==="
       echo "This workflow's server will now be replaced. Follow the outcome:"
-      echo "  - $ART/cutover-status.json   (success | rolled_back | FAILED)"
-      echo "  - $ART/cutover.log"
+      echo "  - $ARTIFACTS_DIR/cutover-status.json   (success | rolled_back | FAILED)"
+      echo "  - $ARTIFACTS_DIR/logs/cutover.log"
       echo "  - and NOTIFY_CMD (if set), which reports the final result to the originating channel."

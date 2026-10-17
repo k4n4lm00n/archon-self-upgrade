@@ -20,11 +20,13 @@ ours** — we don't chase green pipelines on infra we don't own.
 
 > This README is the global index. Details live in [`docs/`](docs/).
 >
-> **Two forms of the same thing:** [`archon-self-upgrade.yaml`](archon-self-upgrade.yaml)
-> is the **canonical, publishable Archon workflow** (self-contained, parameterized, uses the
-> `upstream` + `myfork` two-remote model). [`scripts/`](scripts/) is the equivalent
-> **standalone toolkit** (same model, same env vars) for running the phases by hand without
-> Archon. See [docs/06-workflow.md](docs/06-workflow.md) and [docs/07-publishing.md](docs/07-publishing.md).
+> **One source of truth, two front doors.** [`scripts/`](scripts/) (`lib.sh` + `00`–`05`) is
+> the **canonical implementation** — all logic (target resolution, isolation, the health gate,
+> rollback, known-good promotion) lives there and nowhere else. Run it by hand, or drive it
+> through [`archon-self-upgrade.yaml`](archon-self-upgrade.yaml), which is now a **thin Archon
+> workflow**: each node just `exec`s the matching phase script, adding the workflow surface
+> (chat trigger, per-step status, artifacts, resumability). No logic is duplicated between the
+> two. See [docs/06-workflow.md](docs/06-workflow.md) and [docs/07-publishing.md](docs/07-publishing.md).
 
 ---
 
@@ -45,14 +47,21 @@ you want after **`to`** — the workflow figures out where the ref lives:
 | a **specific commit** | `self upgrade to 1a2b3c4` |
 | your fork's default branch (no target) | `self upgrade` |
 
-**Carrying your live (local) commits.** To test *your* in-flight changes on top of a
-different base, add **`with live commits`** to any of the above — the workflow replays the live
-branch's unmerged commits (patch-id aware) onto the target:
+**Carrying your local commits (off by default).** Most deployments track a fork/upstream ref with
+no unmerged local work, so by default the run deploys the **bare target**. If you *do* run local
+commits on top of the target, turn carry on **persistently** — a per-host preference, set once:
 
-| You want to… | Prompt exactly |
-|--------------|----------------|
-| take **`upstream`'s dev** and re-apply your live commits | `self upgrade to upstream/dev with live commits` |
-| test your live commits on a **previous release** | `self upgrade to v0.5.0 with live commits` |
+```bash
+/self-upgrade set carry-live-commits yes     # or: scripts/self-upgrade-config.sh set carry-live-commits yes
+```
+
+With carry on, every run **re-applies your unmerged commits on top of the target** (patch-id aware —
+anything already merged upstream is dropped, nothing double-applies), seeded from the blessed
+known-good manifest when present, else from the live branch. For a single run you can instead pass
+`CARRY_LIVE_COMMITS=1` as an env var (it overrides the saved preference); `CARRY_LIVE_COMMITS=0`
+forces the bare target for one run. On a carry conflict the run stops with the staging worktree
+left clean (resolve by hand or turn carry off). The preference lives in a host-local config file
+(`config.env`), never in the committed workflow YAML, so it survives redeploys.
 
 Notes:
 - A bare branch name (`self upgrade to feat/x`) is looked up on **your fork first, then
@@ -60,8 +69,8 @@ Notes:
 - Third-party specs are `<owner>/<repo>@<branch>` (assumes GitHub) or `<git-url>@<branch>`.
 - If the target you name can't be found, the run **stops with an error** — it never silently
   deploys something else. (No `to …` at all = your fork's default branch.)
-- Equivalent env vars (they override the prompt): `TARGET_REF=<any git ref>` and
-  `CARRY_LIVE_COMMITS=1`. See [docs/06-workflow.md](docs/06-workflow.md) for the full config
+- Equivalent env vars (they override the prompt and any saved preference): `TARGET_REF=<any git ref>`
+  and `CARRY_LIVE_COMMITS=1` (carry is off by default). See [docs/06-workflow.md](docs/06-workflow.md) for the full config
   and rollback constraints.
 
 ---
@@ -119,8 +128,10 @@ as an entrypoint on a host that has no toolkit checkout. See
 
 ## Status
 
-- Two forms: the canonical Archon workflow and the standalone `scripts/` toolkit — see
-  [`docs/04-operations.md`](docs/04-operations.md).
+- One implementation (`scripts/`), two front doors: run the phase scripts by hand, or drive
+  them through the thin `archon-self-upgrade.yaml` workflow (each node `exec`s a script). See
+  [`docs/04-operations.md`](docs/04-operations.md). Install the scripts where the workflow looks
+  for them (`SELFUPGRADE_SCRIPTS`, default `$HOME/.archon/.local/upgrade`).
 - No top-level driver script — phases are run individually, keeping a human in the loop
   between the non-destructive phases and the destructive cutover.
 
@@ -139,12 +150,14 @@ as an entrypoint on a host that has no toolkit checkout. See
 ## Layout
 
 ```
-archon-self-upgrade.yaml   the publishable Archon workflow (canonical)
-scripts/                   standalone toolkit — same model, run by hand (lib.sh, 00…05)
-scripts/start-current.sh   cold start: detect the last live build and boot it (entrypoint-ready)
-reference/                 sanitized example state files (runtime state.json is gitignored)
-docs/                      this documentation
-LICENSE                    MIT
+scripts/                     the canonical implementation — single source of truth (lib.sh, 00…05)
+scripts/self-upgrade-config.sh  manage persistent per-host preferences (set/get/unset)
+archon-self-upgrade.yaml     thin Archon workflow: each node exec's the matching phase script
+commands/self-upgrade.md     /self-upgrade command: run an upgrade, or set/get/unset a preference
+scripts/start-current.sh     cold start: detect the last live build and boot it (entrypoint-ready)
+reference/                   sanitized example state files (runtime state.json is gitignored)
+docs/                        this documentation
+LICENSE                      MIT
 ```
 
 ## Publishing checklist (marketplace)

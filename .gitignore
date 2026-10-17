@@ -3,6 +3,9 @@ logs/
 *.log
 *.bak-*
 state.json
+resolved.env
+config.env
 cutover-status.json
+smoke-archon/
 .env
 .env.*

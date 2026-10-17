@@ -1,13 +1,19 @@
 # 06 — The `archon-self-upgrade` workflow
 
-[`archon-self-upgrade.yaml`](../archon-self-upgrade.yaml) is the **publishable, generalized**
-version of this toolkit: a self-contained Archon DAG workflow. It inlines the logic of the
-`scripts/` reference implementation so it needs no external files at run time (portable across
-hosts and safe to fetch from the marketplace).
+[`archon-self-upgrade.yaml`](../archon-self-upgrade.yaml) is the Archon DAG workflow that
+exposes this toolkit to chat / the UI / the API. It is a **thin wrapper**: each node `exec`s the
+matching phase script in [`scripts/`](../scripts/) — no logic is inlined or duplicated.
 
-> `scripts/` is the original, host-specific reference implementation (documents the `myfork`
-> single-remote origin). The **YAML is canonical** for the published workflow and uses the
-> corrected two-remote model below.
+> **Single source of truth:** `scripts/` (`lib.sh` + `00`–`05`) holds all the logic — target
+> resolution, isolation, the health gate, rollback, known-good promotion. The YAML only
+> orchestrates it (DAG ordering, per-step status, artifacts, resumability). Each node sets
+> `ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"` (so `state.json` / `resolved.env` / `logs/` land in the
+> run's artifacts) and `exec`s `$SELFUPGRADE_SCRIPTS/0N-*.sh` (default
+> `$HOME/.archon/.local/upgrade`). `preflight` also forwards the trigger prompt via `$ARGUMENTS`
+> so `resolve_target_ref` can honor `self upgrade to <target>`, and persists the resolved config
+> to `resolved.env` so every later node inherits the identical resolution. The cutover is the one
+> node that does not `exec`: it launches `05-cutover.sh` detached (it must outlive the server it
+> replaces) and returns.
 
 ## Prerequisites
 
@@ -56,10 +62,12 @@ automated smoke gate plus the self-healing cutover are the safety mechanism.
 
 ### Why cutover is detached, and how you learn the outcome
 The cutover replaces the very process group the workflow runs inside, so the `cutover` node
-writes a self-contained runner to `$ARTIFACTS_DIR/run-cutover.sh`, launches it with `setsid`,
-and returns immediately. The detached runner reports the terminal outcome three ways:
+launches `05-cutover.sh` with `setsid` (that script is itself the self-contained runner — it
+re-sources `lib.sh` + `state.json` + `resolved.env` and redirects its own output to
+`logs/cutover.log`) and returns immediately. The detached runner reports the terminal outcome
+three ways:
 - `$ARTIFACTS_DIR/cutover-status.json` → `success` | `rolled_back` | `FAILED`
-- `$ARTIFACTS_DIR/cutover.log`
+- `$ARTIFACTS_DIR/logs/cutover.log`
 - **`NOTIFY_CMD`** — if set, called as `"$NOTIFY_CMD "<message>""` on success/rollback/failure.
   Point it at the originating messenger's notifier to be told the result *through the very
   channel you're protecting*.
@@ -69,8 +77,9 @@ Exit codes of the runner: `0` success · `2` rolled back cleanly · `3` rollback
 
 ## Configuration (env vars, with defaults)
 
-All host specifics are env vars resolved in `preflight` and persisted to
-`$ARTIFACTS_DIR/upgrade.env`. Override via project/workflow env.
+All host specifics are env vars (defined in `scripts/lib.sh`), resolved in `preflight` and
+persisted to `$ARTIFACTS_DIR/resolved.env`, which every later phase re-sources. Override via
+project/workflow env.
 
 | Var | Default | Purpose |
 |-----|---------|---------|

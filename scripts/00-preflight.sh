@@ -29,6 +29,14 @@ fi
 
 log "fetching remotes ..."
 git fetch "$FORK_REMOTE" --quiet || die "fetch $FORK_REMOTE failed"
-git fetch "$UPSTREAM_REMOTE" --quiet || log "WARN: fetch $UPSTREAM_REMOTE failed (continuing)"
+# --tags so "latest release" / a bare version tag can be resolved from the prompt below.
+git fetch "$UPSTREAM_REMOTE" --tags --quiet || log "WARN: fetch $UPSTREAM_REMOTE failed (continuing)"
 
-log "preflight OK — remotes ready. TARGET_REF ${TARGET_REF:-<will default to the fork HEAD branch in 02-stage>}"
+# Resolve the deploy target from the trigger prompt ($ARGUMENTS, injected by Archon; empty in
+# standalone use) unless TARGET_REF was set explicitly, then persist the fully-resolved config so
+# every later phase inherits the identical resolution (the workflow runs each phase in a fresh
+# shell). See resolve_target_ref / persist_config in lib.sh and the README "How to run".
+resolve_target_ref "${ARGUMENTS:-}"
+persist_config
+
+log "preflight OK — remotes ready. TARGET_REF $TARGET_REF ($(git rev-parse --short "$TARGET_REF"))"
