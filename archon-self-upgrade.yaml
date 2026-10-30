@@ -45,8 +45,11 @@ description: |
   those scripts; this YAML only orchestrates them and exposes them as an Archon workflow
   (chat trigger, per-step status, artifacts, resumability). The nodes find the toolkit via
   SELFUPGRADE_SCRIPTS (default: $HOME/.archon/.local/upgrade) and point ARCHON_UPGRADE_DIR
-  at $ARTIFACTS_DIR so state.json / resolved.env / logs land in the run's artifacts. Install
-  the toolkit there (copy scripts/*.sh) before running as a workflow.
+  at $ARTIFACTS_DIR so state.json / resolved.env / logs land in the run's artifacts.
+  SELF-BOOTSTRAPPING: if the toolkit is not already installed at SELFUPGRADE_SCRIPTS, the
+  preflight node fetches scripts/ from the published repo (SELFUPGRADE_REPO, default
+  github.com/k4n4lm00n/archon-self-upgrade; SELFUPGRADE_REF, default main) on first run — so
+  this single YAML is self-sufficient from the marketplace, with no separate install step.
 
 provider: claude
 tags:
@@ -71,7 +74,26 @@ nodes:
     bash: |
       set -uo pipefail
       SU="${SELFUPGRADE_SCRIPTS:-$HOME/.archon/.local/upgrade}"
-      [ -d "$SU" ] || { echo "FATAL: self-upgrade scripts dir not found: $SU"; echo "install the scripts/ toolkit there, or set SELFUPGRADE_SCRIPTS to its path."; exit 1; }
+      # Self-bootstrap: the scripts/ toolkit is the single source of truth, so a one-file
+      # marketplace install won't have it yet. If it's absent, fetch it from the published repo
+      # into SU (once; later phases reuse the install). Override repo/ref or pre-install to skip.
+      if [ ! -f "$SU/lib.sh" ]; then
+        SELFUPGRADE_REPO="${SELFUPGRADE_REPO:-https://github.com/k4n4lm00n/archon-self-upgrade}"
+        SELFUPGRADE_REF="${SELFUPGRADE_REF:-main}"
+        echo "self-upgrade toolkit not at $SU — bootstrapping from $SELFUPGRADE_REPO@$SELFUPGRADE_REF"
+        tmp="$(mktemp -d)"
+        if git clone --depth 1 --branch "$SELFUPGRADE_REF" "$SELFUPGRADE_REPO" "$tmp" 2>/dev/null \
+           || git clone --depth 1 "$SELFUPGRADE_REPO" "$tmp"; then
+          mkdir -p "$SU" && cp "$tmp"/scripts/*.sh "$SU"/ && chmod +x "$SU"/*.sh
+          rm -rf "$tmp"; echo "installed toolkit scripts -> $SU"
+        else
+          rm -rf "$tmp"
+          echo "FATAL: could not bootstrap self-upgrade scripts from $SELFUPGRADE_REPO"
+          echo "set SELFUPGRADE_SCRIPTS to a local install, or SELFUPGRADE_REPO/SELFUPGRADE_REF to a reachable source."
+          exit 1
+        fi
+      fi
+      [ -f "$SU/lib.sh" ] || { echo "FATAL: self-upgrade toolkit still missing at $SU after bootstrap"; exit 1; }
       export ARCHON_UPGRADE_DIR="$ARTIFACTS_DIR"   # state.json / resolved.env / logs land in this run's artifacts
       export ARGUMENTS                             # trigger prompt -> resolve_target_ref ("self upgrade to <target>")
       exec bash "$SU/00-preflight.sh"

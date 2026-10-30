@@ -130,8 +130,10 @@ as an entrypoint on a host that has no toolkit checkout. See
 
 - One implementation (`scripts/`), two front doors: run the phase scripts by hand, or drive
   them through the thin `archon-self-upgrade.yaml` workflow (each node `exec`s a script). See
-  [`docs/04-operations.md`](docs/04-operations.md). Install the scripts where the workflow looks
-  for them (`SELFUPGRADE_SCRIPTS`, default `$HOME/.archon/.local/upgrade`).
+  [`docs/04-operations.md`](docs/04-operations.md). The workflow finds the scripts at
+  `SELFUPGRADE_SCRIPTS` (default `$HOME/.archon/.local/upgrade`), and its `preflight` node
+  **self-bootstraps** them from the published repo on first run if they aren't installed yet —
+  so the single YAML works straight from the marketplace.
 - No top-level driver script — phases are run individually, keeping a human in the loop
   between the non-destructive phases and the destructive cutover.
 

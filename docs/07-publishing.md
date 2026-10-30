@@ -48,12 +48,13 @@ that adds one `MarketplaceEntry`.
 ```
 
 Notes:
-- The workflow is **no longer self-contained** — its nodes `exec` the phase scripts in
-  `scripts/`, which are the single source of truth. Publishing must therefore ship the scripts,
-  not just the YAML: either (a) have the marketplace entry / an install step place `scripts/*.sh`
-  at `SELFUPGRADE_SCRIPTS` (default `$HOME/.archon/.local/upgrade`), or (b) point `sourceUrl` at a
-  packaged bundle rather than a single-file blob. A bare blob URL to `archon-self-upgrade.yaml`
-  alone will fail at run time with "self-upgrade scripts dir not found".
+- **Single-file blob is still valid** even though the logic now lives in `scripts/` (the single
+  source of truth). The `preflight` node is **self-bootstrapping**: if the toolkit isn't already
+  installed at `SELFUPGRADE_SCRIPTS` (default `$HOME/.archon/.local/upgrade`), it clones the
+  published repo (`SELFUPGRADE_REPO`, default `github.com/k4n4lm00n/archon-self-upgrade`;
+  `SELFUPGRADE_REF`, default `main`) and installs `scripts/*.sh` there on first run. So a marketplace
+  user who fetches only `archon-self-upgrade.yaml` gets a working workflow with no separate install
+  step. (Pin `SELFUPGRADE_REF` to a tag/SHA if you want the fetched scripts locked to a release.)
 - Keep `sourceUrl`'s `<COMMIT_SHA>` and the `sha` field identical.
 - `requires: [github]` in the workflow means users must have a connected GitHub identity —
   surfaced by the marketplace as a prerequisite.
